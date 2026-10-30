@@ -1,0 +1,5 @@
+# runtime output / local data
+debug_log.txt
+live_export.json
+mobparser_snapshot_*.json
+*.bak
