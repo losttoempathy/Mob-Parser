@@ -235,7 +235,12 @@ end
 -- Aggregation cache (2026-10-30): tables are only rebuilt when the data or
 -- the parameters change, not every frame. Session data refreshes
 -- immediately; all-time data at most every ALLTIME_REFRESH seconds.
+-- 2026-10-30: session data now at most every SESSION_REFRESH seconds too --
+-- a busy party fight adds events most frames, and each refresh re-walks
+-- the whole session. A wipe (generation change) or a filter/view change
+-- still refreshes at once.
 local ALLTIME_REFRESH = 2;
+local SESSION_REFRESH = 0.5;
 local aggCache = {};
 
 local function cached(slot, paramKey, build)
@@ -245,6 +250,12 @@ local function cached(slot, paramKey, build)
     if c ~= nil and c.paramKey == paramKey then
         if c.stamp == stamp then return c.a, c.b; end
         if stamp:sub(1, 1) == 'A' and c.stamp:sub(1, 1) == 'A' and (now - c.at) < ALLTIME_REFRESH then
+            return c.a, c.b;
+        end
+        -- Session: same generation (no wipe since) -> only new events; throttle.
+        if stamp:sub(1, 1) == 'S' and c.stamp:sub(1, 1) == 'S'
+            and stamp:match('^S(%d+):') == c.stamp:match('^S(%d+):')
+            and (now - c.at) < SESSION_REFRESH then
             return c.a, c.b;
         end
     end
