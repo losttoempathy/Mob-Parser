@@ -442,6 +442,22 @@ local function findEntityByServerId(serverId)
         end
         entityIndexCache[serverId] = nil; -- stale -- rescan below
     end
+    -- PERF (2026-10-31): mob / NPC / pet / trust server IDs carry their
+    -- target index in the low 12 bits (0x01000000 + zone<<12 + index), so
+    -- try that one slot before scanning all 2,305. Checked against
+    -- ServerId like the cache above, so a wrong guess just falls through
+    -- to the full scan -- it can never return the wrong entity. Player
+    -- characters (small IDs like 44151) skip this and scan as before.
+    if serverId >= 0x01000000 then
+        local guess = bit.band(serverId, 0xFFF);
+        if guess <= MAX_ENTITY_INDEX then
+            local entity = GetEntity(guess);
+            if entity ~= nil and entity.ServerId == serverId then
+                entityIndexCache[serverId] = guess;
+                return entity;
+            end
+        end
+    end
     for index = 0, MAX_ENTITY_INDEX do
         local entity = GetEntity(index);
         if entity ~= nil and entity.ServerId == serverId then
@@ -576,7 +592,71 @@ end
 -- fight before being fully trusted.
 ---@param entityId number
 ---@return table|nil  { name, job, isPet, ownerName } or nil if not a party member/pet
+-- PERF (2026-10-31): this runs for EVERY action packet in the zone
+-- (before the early-out -- it decides whether the actor is "yours"), and
+-- each call walked all 6 slots with ~5 memory reads apiece, mostly to
+-- answer "no" for other people's fights. Now the party (members + their
+-- pets) is read into a serverId -> info table at most every
+-- PARTY_REFRESH_SECONDS and each packet is one table lookup. Trade-off: a
+-- member or pet that joined/summoned in the last half second isn't
+-- recognised until the next refresh.
+local PARTY_REFRESH_SECONDS = 0.5;
+local partySnapshot = nil;
+local partySnapshotAt = nil;
+
+local function readPartySnapshot()
+    local snap = {};
+    local party = AshitaCore:GetMemoryManager():GetParty();
+    if party == nil then
+        return snap;
+    end
+    for i = 0, 5 do
+        if party:GetMemberIsActive(i) ~= 0 then
+            local memberServerId = party:GetMemberServerId(i);
+            local memberName = party:GetMemberName(i);
+            if memberServerId ~= nil and memberServerId ~= 0 and snap[memberServerId] == nil then
+                snap[memberServerId] = {
+                    name = memberName,
+                    job = party:GetMemberMainJob(i),
+                    isPet = false,
+                    ownerName = nil,
+                };
+            end
+            local memberTargetIndex = party:GetMemberTargetIndex(i);
+            if memberTargetIndex ~= nil and memberTargetIndex ~= 0 then
+                local memberEntity = GetEntity(memberTargetIndex);
+                if memberEntity ~= nil and memberEntity.PetTargetIndex ~= nil
+                    and memberEntity.PetTargetIndex ~= 0 then
+                    local pet = GetEntity(memberEntity.PetTargetIndex);
+                    if pet ~= nil and pet.ServerId ~= nil and pet.ServerId ~= 0
+                        and snap[pet.ServerId] == nil then
+                        snap[pet.ServerId] = {
+                            name = pet.Name,
+                            job = nil, -- pets don't have a job
+                            isPet = true,
+                            ownerName = memberName,
+                        };
+                    end
+                end
+            end
+        end
+    end
+    return snap;
+end
+
 function combat_router.ashita.getPartyMemberInfo(entityId)
+    local now = os.clock();
+    if partySnapshot == nil or partySnapshotAt == nil
+        or (now - partySnapshotAt) >= PARTY_REFRESH_SECONDS or now < partySnapshotAt then
+        partySnapshot = readPartySnapshot();
+        partySnapshotAt = now;
+    end
+    -- Callers only read the fields; the shared table is never mutated.
+    return partySnapshot[entityId];
+end
+
+-- Original per-call version, kept for reference / offline comparison.
+function combat_router.ashita._getPartyMemberInfoUncached(entityId)
     local party = AshitaCore:GetMemoryManager():GetParty();
     if party == nil then
         return nil;
@@ -632,6 +712,14 @@ end
 -- Misses (entity out of range / already despawned) are NOT cached, so a
 -- later packet can still resolve it. Returns nil rather than guessing.
 local entityNameCache = {};
+-- PERF (2026-10-31): a name lookup that misses (entity out of range) used
+-- to rescan all 2,305 entity slots on EVERY packet for that ID. Now a
+-- miss waits NAME_MISS_RETRY_SECONDS before trying again. Names only --
+-- isMonster still looks every time, so no event is ever dropped by this;
+-- at worst a row from a just-loaded entity has no name for ~2 seconds.
+-- Cleared on zone.
+local NAME_MISS_RETRY_SECONDS = 2;
+local entityNameMissUntil = {};
 function combat_router.ashita.entityName(serverId)
     if serverId == nil or serverId == 0 then
         return nil;
@@ -640,14 +728,17 @@ function combat_router.ashita.entityName(serverId)
     if cached ~= nil then
         return cached;
     end
+    local missUntil = entityNameMissUntil[serverId];
+    if missUntil ~= nil and os.clock() < missUntil then
+        return nil;
+    end
     local entity = findEntityByServerId(serverId);
-    if entity == nil then
-        return nil;
-    end
-    local name = entity.Name;
+    local name = entity and entity.Name;
     if type(name) ~= 'string' or name == '' then
+        entityNameMissUntil[serverId] = os.clock() + NAME_MISS_RETRY_SECONDS;
         return nil;
     end
+    entityNameMissUntil[serverId] = nil;
     entityNameCache[serverId] = name;
     return name;
 end
@@ -1325,6 +1416,8 @@ end
 -- serverId -> index cache is dropped. Called from mobparser.lua on 0x00A.
 function combat_router.onZone()
     entityIndexCache = {};
+    entityNameMissUntil = {}; -- (2026-10-31)
+    partySnapshot = nil;      -- (2026-10-31) re-read the party in the new zone
 end
 
 return combat_router;
