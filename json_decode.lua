@@ -4,11 +4,9 @@ mobparser -- json_decode.lua
 Minimal, dependency-free JSON decoder, written to match json_encode.lua
 (same project, same narrow-scope philosophy -- see that file's header
 for why this project writes its own rather than vendoring an unverified
-third-party library). Built specifically to make export_log.lua's
-saveToMasterAndWipe able to genuinely read-merge-write an existing
-master file, rather than the refuse-if-exists placeholder it shipped
-with initially (see that function's own "KNOWN GAP" comment, now
-resolved by this file's existence).
+third-party library). Originally built for export_log's master-file
+merge (removed 2026-10-30); now used by alltime_db.lua to read
+db\events.jsonl and db\gear.jsonl.
 
 Scope: a standard recursive-descent JSON parser covering the full JSON
 grammar (objects, arrays, strings with escapes, numbers, true/false/

@@ -15,8 +15,7 @@ concludes -- don't extend this into becoming the real pipeline.
 local debug_log = {};
 
 debug_log.settings = {
-    -- No default -- same "fail safe rather than guess a path" logic as
-    -- unknownlog.settings.chatlogsDir. Must be set explicitly before
+    -- No default -- fail safe rather than guess a path. Must be set explicitly before
     -- this module writes anything.
     outputPath = nil,
 

@@ -44,17 +44,8 @@ warning against exactly that).
     - `export_log.wipe()` -- clears in-memory session state (events +
       gearStates) back to empty. Does NOT export or write anything
       first -- if the data isn't wanted, this is a clean discard.
-    - `export_log.saveToMasterAndWipe(masterPath)` -- the combined
-      operation the user specifically asked for: reads any existing
-      master JSON file, merges the current session's events and
-      gearStates into it (renumbering gearStateIds to avoid cross-
-      session collisions -- see the function's own comment for exactly
-      what "merge" does and does not do, e.g. no cross-session gear-
-      state deduplication in v1), writes the combined result back to
-      masterPath, THEN wipes running memory. This is the "consolidate
-      and start fresh" workflow. Requires json_decode.lua (built
-      alongside this file specifically to make real merging possible,
-      rather than shipping a refuse-if-exists placeholder).
+    - (save-to-master-and-wipe was removed 2026-10-30; the all-time
+      database in db\ replaced it.)
   Kept as three separate functions (not one do-everything call) so a
   future UI/command layer can expose "just export," "just wipe," and
   "save+wipe" as genuinely distinct user actions, matching how the
@@ -62,7 +53,6 @@ warning against exactly that).
 ]]
 
 local json_encode = require('json_encode');
-local json_decode = require('json_decode');
 
 local export_log = {};
 
@@ -103,13 +93,18 @@ local WEAPON_SLOTS = { 'Main', 'Sub', 'Range', 'Ammo' };
 local persist = nil;
 local persistError = nil;
 
--- Bumped on every wipe so a reader can tell "same event count, different
--- events" apart (GUI cache).
-local generation = 0;
+-- Session size cap (2026-10-30, perf). With Clear on zone off, or a long
+-- stay in one zone, the running session grew without limit -- and every
+-- GUI rebuild with it. Past MAX_SESSION_EVENTS the oldest 10% are dropped
+-- from the RUNNING SESSION ONLY (the all-time database keeps every event).
+-- Done in one batch into a new table, so it is rare, and the GUI sees a
+-- new table and rebuilds cleanly. gearStates are kept (small, still
+-- referenced by the remaining events).
+local MAX_SESSION_EVENTS = 50000;
+local trimmedTotal = 0;
 
 -- Builds a stable, order-independent signature string for a `worn`
--- table (as returned by dlac_listener.currentComposition/
--- compositionFor), so two calls describing the identical composition
+-- table (as returned by dlac_listener.currentComposition), so two calls describing the identical composition
 -- produce the identical signature regardless of Lua's unspecified
 -- pairs() iteration order. Uses dlac_listener's own canonical slot
 -- list ordering (not alphabetical, not insertion order) so this stays
@@ -144,7 +139,7 @@ end
 -- reused the same way a real composition would be, so every event
 -- always has a valid gearStateId to reference, never a special-cased
 -- nil).
----@param worn table|nil  from dlac_listener's currentComposition/compositionFor
+---@param worn table|nil  from dlac_listener's currentComposition
 ---@return number  gearStateId
 function export_log.internGearState(worn)
     local sig = gearSignature(worn);
@@ -236,6 +231,13 @@ function export_log.record(fields)
     end
 
     table.insert(session.events, event);
+    if #session.events > MAX_SESSION_EVENTS then
+        local drop = math.floor(MAX_SESSION_EVENTS * 0.1);
+        local kept = {};
+        for i = drop + 1, #session.events do kept[#kept + 1] = session.events[i]; end
+        session.events = kept;
+        trimmedTotal = trimmedTotal + drop;
+    end
 
     if persist ~= nil then
         local gid = event.gearStateId;
@@ -259,10 +261,6 @@ function export_log.persistError()
     return persistError;
 end
 
-function export_log.generation()
-    return generation;
-end
-
 -- ===========================================================================
 -- Export / lifecycle operations -- see module header for the three-
 -- operation design and why they're kept separate.
@@ -278,9 +276,22 @@ function export_log.exportSession()
     });
 end
 
+-- (2026-10-31) References to the current session's tables, for a party
+-- save (party_saves.capture) taken just before wipe(). Safe to keep after
+-- the wipe: wipe() REPLACES these tables, it never clears them in place,
+-- and record() only ever appends to the new ones. Callers must not mutate.
+function export_log.snapshot()
+    return {
+        events = session.events,
+        gearById = gearStateById,
+        idsById = weaponIdsByGearState,
+        trimmed = trimmedTotal,
+    };
+end
+
 -- Clears in-memory session state entirely. Does NOT export or save
 -- anything first -- callers wanting to preserve data before wiping
--- should call exportSession() or saveToMasterAndWipe() instead.
+-- should call exportSession() first.
 function export_log.wipe()
     session.events = {};
     session.gearStates = {};
@@ -288,13 +299,18 @@ function export_log.wipe()
     gearStateIdBySignature = {};
     weaponIdsByGearState = {};
     gearStateById = {};
-    generation = generation + 1;
+    trimmedTotal = 0;
 end
 
 -- Returns the number of events / gear states currently held in memory
 -- -- for a status command / load-message summary, so the user can see
 -- session size without exporting it first.
 ---@return number eventCount, number gearStateCount
+-- Events dropped from the running session by MAX_SESSION_EVENTS (2026-10-30).
+function export_log.trimmed()
+    return trimmedTotal;
+end
+
 function export_log.stats()
     return #session.events, #session.gearStates;
 end
@@ -316,133 +332,6 @@ end
 ---@return table  session.events, live reference, DO NOT MUTATE
 function export_log.liveEvents()
     return session.events;
-end
-
--- ===========================================================================
--- Master-file consolidation
--- ===========================================================================
-
--- Reads and decodes an existing master JSON file, if any. Returns
--- { events = {...}, gearStates = {...} } (empty arrays if the file
--- doesn't exist yet), or raises an error if the file exists but is not
--- valid JSON (a corrupt/hand-edited master file is a real problem
--- worth surfacing loudly, not silently discarding).
-local function readMasterFile(masterPath)
-    local file = io.open(masterPath, 'r');
-    if file == nil then
-        return { events = {}, gearStates = {} }; -- doesn't exist yet -- fresh start
-    end
-    local content = file:read('*a');
-    file:close();
-
-    if not content:match('%S') then
-        return { events = {}, gearStates = {} }; -- exists but empty -- treat as fresh
-    end
-
-    local decoded = json_decode.decode(content);
-    return {
-        events = decoded.events or {},
-        gearStates = decoded.gearStates or {},
-    };
-end
-
--- Appends the current session into a persistent master JSON file, then
--- wipes running memory. This is the exact "save to master, then wipe
--- the running parser memory" workflow the user asked for.
---
--- REAL merge (2026-07-28, once json_decode.lua existed to make this
--- possible -- see that file's own header for why it was built). Reads
--- the existing master file (if any), decodes it, RENUMBERS the current
--- session's gearStateIds to continue after the master file's highest
--- existing id (so two sessions' gear-state tables don't collide -- a
--- gearStateId of 3 in the master file and a gearStateId of 3 in this
--- session almost certainly do NOT refer to the same composition), then
--- appends both the renumbered events and the renumbered gearStates
--- onto the master file's existing arrays, and writes the combined
--- result back out.
---
--- Gear-state DEDUPLICATION across sessions is intentionally NOT
--- attempted here (v1 scope) -- the same composition seen in two
--- different sessions will get two different gearStates entries in the
--- combined master file, rather than being recognized as identical and
--- merged into one. This is a real, deliberate limitation, not an
--- oversight: proper cross-session dedup would need to compare full
--- compositions (not just ids, which are already known to collide
--- across sessions) against the master file's existing entries, which
--- is more work than this pass is scoping in -- correctness (never
--- silently merging two DIFFERENT compositions under one id) matters
--- more here than file-size efficiency across sessions, and simply not
--- deduplicating is always safe, just not maximally compact. Revisit if
--- master-file size across many sessions becomes a real problem.
----@param masterPath string  full path to the master JSON file
----@return boolean ok, string message
-function export_log.saveToMasterAndWipe(masterPath)
-    local ok, master = pcall(readMasterFile, masterPath);
-    if not ok then
-        return false, 'existing master file at "' .. masterPath ..
-            '" could not be read as valid JSON (' .. tostring(master) ..
-            ') -- refusing to proceed rather than overwrite or guess. ' ..
-            'Session data was NOT wiped.';
-    end
-
-    -- Find the highest gearStateId already in the master file, so this
-    -- session's ids can be renumbered to continue after it without
-    -- collision.
-    local maxExistingId = 0;
-    for _, gs in ipairs(master.gearStates) do
-        if type(gs.id) == 'number' and gs.id > maxExistingId then
-            maxExistingId = gs.id;
-        end
-    end
-
-    local idOffset = maxExistingId; -- this session's id N becomes N + idOffset
-    local combinedGearStates = {};
-    for _, gs in ipairs(master.gearStates) do
-        table.insert(combinedGearStates, gs);
-    end
-    for _, gs in ipairs(session.gearStates) do
-        local renumbered = {};
-        for k, v in pairs(gs) do
-            renumbered[k] = v;
-        end
-        renumbered.id = gs.id + idOffset;
-        table.insert(combinedGearStates, renumbered);
-    end
-
-    local combinedEvents = {};
-    for _, ev in ipairs(master.events) do
-        table.insert(combinedEvents, ev);
-    end
-    for _, ev in ipairs(session.events) do
-        local renumbered = {};
-        for k, v in pairs(ev) do
-            renumbered[k] = v;
-        end
-        if renumbered.gearStateId ~= nil then
-            renumbered.gearStateId = renumbered.gearStateId + idOffset;
-        end
-        table.insert(combinedEvents, renumbered);
-    end
-
-    local json = json_encode.encode({
-        events = (#combinedEvents > 0) and combinedEvents or json_encode.EMPTY_ARRAY,
-        gearStates = (#combinedGearStates > 0) and combinedGearStates or json_encode.EMPTY_ARRAY,
-    });
-
-    local file, openErr = io.open(masterPath, 'w');
-    if file == nil then
-        return false, 'could not open master file for writing: ' .. tostring(openErr) ..
-            ' -- session data was NOT wiped.';
-    end
-    file:write(json);
-    file:close();
-
-    local sessionEventCount = #session.events;
-    local sessionGearStateCount = #session.gearStates;
-    export_log.wipe();
-    return true, string.format(
-        'merged %d event(s) and %d gear state(s) into master file (now %d event(s) total); running session wiped.',
-        sessionEventCount, sessionGearStateCount, #combinedEvents);
 end
 
 return export_log;

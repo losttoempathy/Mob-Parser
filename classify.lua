@@ -741,29 +741,6 @@ classify.PET_TP_MSG = {
     DAMAGE = 317,
 };
 
--- General pet-related messages -- added 2026-07-29 (msg.lua gap-audit).
--- Separate table from PET_TP_MSG above (which is specifically
--- category-13 pet TP moves, confirmed by live capture) since these
--- three are a different shape: NO_EFFECT_ON_PET is a landed-outcome
--- message ("no effect on that pet" -- something targeted a pet and
--- fizzled), while PET_CANNOT_DO_ACTION/PET_NOT_ENOUGH_TP are
--- use-failure system messages (the pet itself couldn't act) -- not
--- dispatched as combat outcomes, see classify.OUTCOME.PET_NO_EFFECT's
--- own comment.
-classify.PET_MSG = {
-    NO_EFFECT_ON_PET     = 336,
-    PET_CANNOT_DO_ACTION = 574, -- use-failure, not dispatched
-    PET_NOT_ENOUGH_TP    = 575, -- use-failure, not dispatched
-};
-
-classify.ANIMATION = {
-    MELEE_MAIN    = 0,
-    MELEE_OFFHAND = 1,
-    MELEE_KICK    = 2,
-    MELEE_KICK2   = 3,
-    DAKEN         = 4,
-};
-
 -- Outcome bucket names -- the single, unambiguous result of one swing.
 classify.OUTCOME = {
     HIT         = 'HIT',
@@ -951,13 +928,12 @@ classify.OUTCOME = {
     TOO_FAR              = 'TOO_FAR',              -- offense: action never went off -- target out of range (msg 78). Excluded from hit AND miss tallies, damage 0.
     JA_NO_MESSAGE        = 'JA_NO_MESSAGE',        -- ability resolved on this target with message 0 (no chat text) -- e.g. AscensionXI custom "Resonance"; raw param kept
 
-    -- Pet-related outcomes -- added 2026-07-29 (msg.lua gap-audit). See
-    -- classify.PET_MSG below for confirmed message IDs. NO_EFFECT_ON_PET
-    -- is the only one of the three gap-list pet entries dispatched as a
-    -- landed outcome -- PET_CANNOT_DO_ACTION/PET_NOT_ENOUGH_TP are
-    -- use-failure system messages, kept in PET_MSG for completeness but
-    -- not wired into dispatch (same reasoning as the JA use-failure
-    -- messages above).
+    -- Pet-related outcomes -- added 2026-07-29 (msg.lua gap-audit).
+    -- NO_EFFECT_ON_PET (msg 336) is the only one of the three gap-list pet
+    -- entries dispatched as a landed outcome -- PET_CANNOT_DO_ACTION (574)
+    -- and PET_NOT_ENOUGH_TP (575) are use-failure system messages, not
+    -- wired into dispatch (same reasoning as the JA use-failure messages
+    -- above). (The unused classify.PET_MSG table was removed 2026-10-30.)
     PET_NO_EFFECT = 'PET_NO_EFFECT',
 };
 
@@ -1002,77 +978,6 @@ local function unknownRaw(result)
     };
 end
 
--- Outcomes that count as "attempt landed" for hit-rate purposes (the
--- numerator formula.lua's hitRate/inverseEva/inverseAcc need). SHADOWS
--- counts as a landed hit for accuracy purposes -- confirmed in
--- packet_ground_truth.md / Metrics source: "these are counted as hits in
--- terms of accuracy... If you actually miss, only then should the
--- accuracy suffer." Same logic applies whichever side of combat this is.
--- MOB_HEAL also counts: your attack still passed its accuracy roll --
--- it just healed the mob instead of damaging it (a mob-type side effect,
--- not an accuracy failure). Corrected 2026-07-27 -- this was previously
--- silently excluded by omission, discovered during an audit of every
--- discard/fold decision in this file (see project file "classifier
--- discard audit").
--- PARRY also counts as a hit -- CONFIRMED by user (2026-07-27): "Parry
--- is a hit. It's a damage mitigation function." The accuracy roll landed;
--- parry is a SEPARATE, later mitigation step that reduces damage, not an
--- accuracy failure. IMPORTANT: PARRY still needs its own distinct
--- tracking for the future ATT/DEF (damage-based) regression -- a
--- parried hit's damage does NOT reflect normal pdifSpread math (it's
--- been reduced by the parry mitigation itself), so parried damage must
--- NEVER be pooled into the same dmgSum/dmgSumSq bucket as normal/crit
--- hits, or it will corrupt the DEF estimate. classify.lua reports PARRY
--- as its own outcome specifically so callers can do this correctly --
--- see classify.IS_DAMAGE_MITIGATED below.
-classify.COUNTS_AS_HIT = {
-    [classify.OUTCOME.HIT]          = true,
-    [classify.OUTCOME.CRIT]         = true,
-    [classify.OUTCOME.SHADOWS]      = true,
-    [classify.OUTCOME.GUARD]        = true,
-    [classify.OUTCOME.SHIELD_BLOCK] = true,
-    [classify.OUTCOME.UNMITIGATED]  = true,
-    [classify.OUTCOME.COUNTER]      = true,  -- the swing that PROVOKED the counter still landed
-    [classify.OUTCOME.MOB_HEAL]     = true,
-    [classify.OUTCOME.PARRY]        = true,
-};
-
--- Outcomes whose damage value is NOT a clean sample of the normal
--- pdifSpread distribution -- a separate mitigation mechanic altered the
--- damage after the accuracy roll landed. These outcomes DO count toward
--- the ACC/EVA hit-rate tally (see COUNTS_AS_HIT above) but their damage
--- values must be tracked SEPARATELY from ordinary HIT/CRIT damage for
--- any future ATT/DEF (damage-based) regression -- pooling them together
--- would corrupt the DEF estimate (project file: user is planning to test
--- damage mitigation specifically, so this distinction is a real,
--- near-term requirement, not a hypothetical).
--- GUARD and SHIELD_BLOCK are ALSO damage-mitigated for the same reason
--- (both reduce damage via a mechanic outside the normal pDIF formula) --
--- included here for the same protection, even though this wasn't
--- explicitly asked about yet.
-classify.IS_DAMAGE_MITIGATED = {
-    [classify.OUTCOME.PARRY]        = true,
-    [classify.OUTCOME.GUARD]        = true,
-    [classify.OUTCOME.SHIELD_BLOCK] = true,
-};
-
--- Outcomes that count as a genuine miss (accuracy failure) for hit-rate
--- purposes.
-classify.COUNTS_AS_MISS = {
-    [classify.OUTCOME.MISS] = true,
-};
-
--- DODGE (Perfect Dodge) is excluded from BOTH hit and miss counts --
--- confirmed in packet_ground_truth.md: "excluded from ACC denominator."
--- It's a guaranteed-evade effect, not a normal accuracy roll, so it must
--- not be counted as either an attempt or a miss for hit-rate purposes.
-
--- PARRY: RESOLVED 2026-07-27 (user decision) -- counts as a HIT for
--- accuracy purposes (see COUNTS_AS_HIT above), but is ALSO flagged in
--- IS_DAMAGE_MITIGATED so its damage value stays out of the normal
--- pdifSpread damage pool for any future ATT/DEF regression. See both
--- tables above for the full reasoning.
-
 -- ===========================================================================
 -- OFFENSE: classify a swing where the tracked player is the attacker.
 -- ===========================================================================
@@ -1111,8 +1016,8 @@ function classify.offense(result)
     -- 2026-10-29: mob countered this swing. The swing itself carries
     -- message 0 / param 0 (no damage to the mob); the counter damage the
     -- ATTACKER took rides the spike block. Reported as its own outcome,
-    -- damage 0 (nothing dealt to the mob), and deliberately NOT in
-    -- COUNTS_AS_HIT or COUNTS_AS_MISS -- whether a countered swing passed
+    -- damage 0 (nothing dealt to the mob), and deliberately NOT in the
+    -- GUI's COUNTS_AS_HIT or COUNTS_AS_MISS -- whether a countered swing passed
     -- its accuracy roll isn't knowable from this packet, so it stays out
     -- of the ACC/EVA math entirely rather than skewing it either way.
     -- counterDamage reads spike_effect_param -- CONFIRMED present in
@@ -1124,8 +1029,8 @@ function classify.offense(result)
 
     -- 2026-10-29: "<target> is too far away" -- the action (seen on a
     -- weaponskill, which falls through to this function) never went off.
-    -- Not an accuracy roll, so it's in neither COUNTS_AS_HIT nor
-    -- COUNTS_AS_MISS. See classify.MSG.TOO_FAR_AWAY for the evidence.
+    -- Not an accuracy roll, so it's in neither the GUI's COUNTS_AS_HIT
+    -- nor COUNTS_AS_MISS. See classify.MSG.TOO_FAR_AWAY for the evidence.
     if msg == classify.MSG.TOO_FAR_AWAY then
         return classify.OUTCOME.TOO_FAR, 0;
     end

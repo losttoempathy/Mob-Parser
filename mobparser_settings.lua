@@ -1,9 +1,8 @@
 --[[
 mobparser -- mobparser_settings.lua
 
-Machine-wide (NOT per-character -- chatlogsDir is an install path, not a
-per-character value) settings persistence, backing store for
-unknownlog.settings.chatlogsDir.
+Machine-wide (NOT per-character) settings persistence for mobparser's
+GUI and session options.
 
 ADAPTED (2026-07-29) from the user's own confirmed-working GearDB/
 settings.lua pattern -- same io.open()-based load/save, same
@@ -27,10 +26,6 @@ local M = {};
 -- ---------------------------------------------------------------------------
 local function defaults()
     return {
-        -- Mirrors unknownlog.settings.chatlogsDir's own "no default,
-        -- fail safe rather than guess wrong" design -- nil here means
-        -- "not yet configured," not "forgot to set a value."
-        chatlogsDir = nil,
         -- Number of player rows the in-game GUI table shows (1-18).
         guiMaxPlayers = 6,
         -- Show enemy (mob) rows in the GUI's Player view. Off by default
@@ -57,9 +52,8 @@ M.data = defaults();
 -- Paths
 -- ---------------------------------------------------------------------------
 -- Machine-wide install directory, NOT keyed by character/server id (that's
--- GearDB's own pattern -- deliberately not followed here since
--- chatlogsDir is a machine-wide value, not a per-character one -- see
--- user decision 2026-07-29).
+-- GearDB's own pattern -- deliberately not followed here; these are
+-- machine-wide settings -- see user decision 2026-07-29).
 local function installDir()
     local dir = nil;
     pcall(function()
@@ -136,15 +130,9 @@ function M.load()
     if not ok or fn == nil then return false; end
     local ok2, tbl = pcall(fn);
     if not ok2 or type(tbl) ~= 'table' then return false; end
-    if type(tbl.chatlogsDir) == 'string' then
-        M.data.chatlogsDir = tbl.chatlogsDir;
-    end
-    -- Carry every other saved scalar across too (probeEnabled,
-    -- autoRefreshEnabled, guiMaxPlayers, ...). Previously only
-    -- chatlogsDir survived a reload, so any other saved key was
-    -- silently dropped on load and then erased on the next save().
+    -- Carry every saved scalar across (guiMaxPlayers, clearOnZone, ...).
     for k, v in pairs(tbl) do
-        if type(k) == 'string' and k ~= 'chatlogsDir' then
+        if type(k) == 'string' then
             local t = type(v);
             if t == 'boolean' or t == 'number' or t == 'string' then
                 M.data[k] = v;

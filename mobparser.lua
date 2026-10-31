@@ -29,8 +29,7 @@ Still unverified from before the pivot (unaffected by it):
   2. combat_router.ashita.*'s entity-index bound (MAX_ENTITY_INDEX) --
      still unverified but has worked correctly in every live test so
      far via a confirmed-safe fallback.
-  3. unknownlog.ashita.getCharacterName() -- still untested in-game.
-  4. dlac_listener transport -- CONFIRMED working via live test (see
+  3. dlac_listener transport -- CONFIRMED working via live test (see
      project file's dlac live-test-results sections). Gear-tag TIMING
      correctness -- CONFIRMED for both single-slot and multi-slot
      mid-fight swaps via live test.
@@ -44,13 +43,7 @@ JSON, not just debug_log.lua's diagnostic text) and the eventual GOAL
 
 TEMPORARY TESTING DEFAULT REMAINING BELOW: debug log output path
 (debugLogPath, computed from addon.path) -- see debug_log.lua for its
-own retirement status. The chatlogsDir hardcoded default that used to
-live here was removed 2026-07-29 (see unknownlog.lua); it's now backed
-by a REAL persisted settings file (mobparser_settings.lua, adapted from
-the user's own confirmed-working GearDB/settings.lua pattern) set via
-`/mobparser setchatlogs <path>`. UNTESTED IN-GAME -- this is the first
-real test of mobparser_settings.lua's AshitaCore:GetInstallPath()-based
-path and io.open() load/save round-trip.
+own retirement status.
 ]]
 
 addon.name    = 'mobparser';
@@ -109,15 +102,10 @@ require('common');
 local chat = require('chat');
 
 local combat_router = require('combat_router');
-local unknownlog    = require('unknownlog');
 local debug_log     = require('debug_log');
 local dlac_listener = require('dlac_listener');
 local export_log    = require('export_log');
 local mobparser_settings = require('mobparser_settings');
--- REMOVED (2026-10-30): live_export. It rewrote live_export.json from the
--- whole session up to 4x/sec on d3d_present, for mobstats -- which is
--- retired, so nothing read it. live_export.lua is left on disk but no
--- longer required; /mobparser export and db\ still save everything.
 -- All-time database (2026-10-30): every recorded event is also appended to
 -- <addon>\db\events.jsonl. pcall'd so a missing/broken module never stops
 -- capture.
@@ -126,6 +114,29 @@ if not dbOk then
     print(chat.header('mobparser') .. chat.message(
         'all-time database module failed to load (non-fatal): ' .. tostring(alltime_db)));
     alltime_db = nil;
+end
+-- Party saves (2026-10-31): a snapshot of the session is written to
+-- <addon>\db\saves\ every time it is cleared (zone, Clear data, wipe,
+-- unload). pcall'd like the database -- never stops capture.
+local psOk, party_saves = pcall(require, 'party_saves');
+if not psOk then
+    print(chat.header('mobparser') .. chat.message(
+        'party saves module failed to load (non-fatal): ' .. tostring(party_saves)));
+    party_saves = nil;
+end
+
+-- Snapshot the running session into a party save, then wipe it. Every
+-- path that clears the session goes through here. Returns the save's
+-- meta (nil if the session was empty or saves are unavailable).
+local function saveAndWipe(reason)
+    local meta = nil;
+    if party_saves ~= nil and export_log.snapshot ~= nil then
+        local ok, res = pcall(party_saves.capture, export_log.snapshot(), reason);
+        if ok then meta = res;
+        else print(chat.header('mobparser') .. chat.message('party save failed (non-fatal): ' .. tostring(res))); end
+    end
+    export_log.wipe();
+    return meta;
 end
 -- REMOVED (2026-10-29): mobparser_probe (the /check + /checkparam
 -- packet-sending probe, T1 on CatsEyeXI). Retired at user request on
@@ -162,32 +173,45 @@ end
 -- comment below for why this is flagged, not silently assumed safe.
 local dlacState = dlac_listener.newState();
 
--- File-scope (not local to any single event handler) so both the
--- `load` handler (which computes it from addon.path, only known once
--- the addon is actually loading) and the `command` handler (which
--- needs to read it later, in a separate closure) can see the same
--- value. Starts nil; set once inside the `load` handler below. BUGFIX
--- (2026-07-28, caught before ever running in-game, by re-reading this
--- file rather than assuming the closure-local version from the load
--- handler would be visible elsewhere -- it would NOT have been, each
--- ashita.events.register(...) callback is its own separate closure).
-local masterExportPath = nil;
+-- ---------------------------------------------------------------------------
+-- Error throttle (2026-10-30, perf). The per-frame (d3d_present) and
+-- per-packet handlers used to print EVERY error to chat -- a GUI or
+-- database error that repeats prints ~60 lines a second, which alone can
+-- tank FPS. Now: each distinct message prints once; repeats are counted
+-- and summarised at most every ERROR_REPEAT_SECONDS.
+-- ---------------------------------------------------------------------------
+local ERROR_REPEAT_SECONDS = 10;
+local errorSeen = {}; -- message -> { suppressed = n, lastPrint = t }
+local errorSeenCount = 0;
+
+local function reportError(prefix, err)
+    local msg = prefix .. tostring(err);
+    local now = os.clock();
+    local s = errorSeen[msg];
+    if s == nil then
+        errorSeenCount = errorSeenCount + 1;
+        if errorSeenCount > 200 then errorSeen = {}; errorSeenCount = 1; end -- bound memory
+        errorSeen[msg] = { suppressed = 0, lastPrint = now };
+        print(chat.header('mobparser') .. chat.message(msg));
+        return;
+    end
+    s.suppressed = s.suppressed + 1;
+    if (now - s.lastPrint) >= ERROR_REPEAT_SECONDS then
+        print(chat.header('mobparser') .. chat.message(string.format(
+            '%s (repeated %d more time(s))', msg, s.suppressed)));
+        s.suppressed = 0;
+        s.lastPrint = now;
+    end
+end
+
+-- GUI is switched off after this many render errors in a row, so a broken
+-- window can't keep costing frames. /mobparser gui turns it back on.
+local GUI_MAX_CONSECUTIVE_ERRORS = 5;
+local guiErrorStreak = 0;
+local guiSuspended = false;
 
 ashita.events.register('load', 'mobparser_load', function()
-    -- RETIRED (2026-07-29): the hardcoded unknownlog.setChatlogsDir(...)
-    -- testing default that lived here has been removed, matching
-    -- unknownlog.lua's own settings table reverting chatlogsDir to nil
-    -- -- see that file for the full rationale. In its place: load a
-    -- REAL persisted setting via mobparser_settings.lua (adapted from
-    -- the user's own confirmed-working GearDB/settings.lua pattern --
-    -- io.open()-based, not the unverified ashita.settings API). If no
-    -- settings file exists yet (first run), chatlogsDir stays nil and
-    -- chat correlation fails safe, same as before -- use
-    -- `/mobparser setchatlogs <path>` to set and persist one.
     mobparser_settings.load();
-    if mobparser_settings.data.chatlogsDir ~= nil then
-        unknownlog.setChatlogsDir(mobparser_settings.data.chatlogsDir);
-    end
 
     -- (2026-10-29) probeEnabled / autoRefreshEnabled restore removed
     -- with the probe. An old settings file may still carry those keys;
@@ -199,7 +223,7 @@ ashita.events.register('load', 'mobparser_load', function()
     -- whether AshitaCore:GetInstallPath() worked and just found no
     -- settings file yet (normal first run), or GetInstallPath() itself
     -- failed/returned nil and installDir() bailed out early -- both
-    -- print "chatlogsDir: nil" with no visible difference. Same trap
+    -- print the same thing with no visible difference. Same trap
     -- already documented once in this file for addon.path/debug_log --
     -- print the actual resolved path directly rather than inferring it
     -- indirectly from later save/load behavior.
@@ -299,20 +323,6 @@ ashita.events.register('load', 'mobparser_load', function()
             'still works without gear tagging): ' .. tostring(dlacErr)));
     end
 
-    -- Master export file path (2026-07-28, scope pivot) -- same
-    -- confirmed-working addon.path pattern as debugLogPath above (no
-    -- doubled-separator issue, since the earlier bugfix already
-    -- established the correct concatenation). This is where
-    -- `/mobparser save` writes via export_log.saveToMasterAndWipe --
-    -- see that function's own comment for exactly what "save" does
-    -- (real read-merge-write, not a naive overwrite). NO `local` here
-    -- deliberately -- assigns the file-scope variable declared near the
-    -- top of this file, so the separate `command` event handler closure
-    -- below can read the same value (see that variable's own comment
-    -- for why a closure-local version here would NOT have been visible
-    -- there -- a real bug caught and fixed before ever running in-game).
-    masterExportPath = (addon.path or '.\\') .. 'mobparser_export.json';
-
     -- All-time database (2026-10-30). Injected into export_log so its own
     -- offline tests don't need it.
     if alltime_db ~= nil then
@@ -322,6 +332,17 @@ ashita.events.register('load', 'mobparser_load', function()
         else
             print(chat.header('mobparser') .. chat.message(
                 'all-time database init failed (non-fatal): ' .. tostring(dbErr)));
+        end
+    end
+
+    -- Party saves (2026-10-31): db\saves\ (db\ created first in case
+    -- create_directory doesn't make nested folders).
+    if party_saves ~= nil then
+        local base = (addon.path or '.\\') .. 'db\\';
+        local okPs, psErr = pcall(party_saves.init, base .. 'saves\\', base);
+        if not okPs then
+            print(chat.header('mobparser') .. chat.message(
+                'party saves init failed (non-fatal): ' .. tostring(psErr)));
         end
     end
 
@@ -353,18 +374,21 @@ ashita.events.register('packet_in', 'mobparser_packet_in', function(e)
     -- try to tell them apart).
     local ok, err = pcall(combat_router.handlePacket, e.id, e.data, dlacState);
     if not ok then
-        print(chat.header('mobparser') .. chat.message(
-            'packet handler error (this is real information now, not ' ..
-            'an expected skeleton-build error -- note what triggered it): '
-            .. tostring(err)));
+        -- (2026-10-30) throttled -- see reportError
+        reportError('packet handler error (note what triggered it): ', err);
     end
 
     -- Clear on zone (2026-10-30, user setting, on by default): 0x00A is
     -- the incoming zone-in packet (the same ID the removed probe used for
     -- its zone-change reset). Wipes only the in-memory session -- the
     -- all-time database already has every event. Silent, no chat line.
-    if e.id == 0x00A and mobparser_settings.data.clearOnZone ~= false then
-        export_log.wipe();
+    if e.id == 0x00A then
+        -- (2026-10-30, perf) entity indexes are per zone: drop the cache.
+        -- Always, whatever the Clear-on-zone setting.
+        pcall(combat_router.onZone);
+        if mobparser_settings.data.clearOnZone ~= false then
+            saveAndWipe('zone'); -- (2026-10-31) party save first
+        end
     end
 
     -- (2026-10-29) The probe's packet branches that used to follow here
@@ -422,10 +446,11 @@ end
 
 local function doWipe()
     local eventCount, gearStateCount = export_log.stats();
-    export_log.wipe();
+    local meta = saveAndWipe('clear'); -- (2026-10-31) party save first
     return true, string.format(
-        'wiped running session (%d event(s), %d gear state(s) discarded).',
-        eventCount, gearStateCount);
+        'wiped running session (%d event(s), %d gear state(s))%s.',
+        eventCount, gearStateCount,
+        meta and (' -- kept as party save ' .. meta.file) or '');
 end
 
 if mobparser_gui ~= nil and mobparser_gui.setActions ~= nil then
@@ -454,18 +479,31 @@ ashita.events.register('command', 'mobparser_command', function(e)
     elseif sub == 'status' then
         local eventCount, gearStateCount = export_log.stats();
         print(chat.header('mobparser') .. chat.message(string.format(
-            'running session: %d event(s), %d gear state(s). Master file: %s. Clear on zone: %s. Debug log: %s',
-            eventCount, gearStateCount, tostring(masterExportPath),
+            'running session: %d event(s)%s, %d gear state(s). Clear on zone: %s. Debug log: %s',
+            eventCount,
+            (export_log.trimmed ~= nil and export_log.trimmed() > 0)
+                and string.format(' (%d oldest trimmed, still in database)', export_log.trimmed()) or '',
+            gearStateCount,
             (mobparser_settings.data.clearOnZone ~= false) and 'on' or 'off',
             debug_log.isEnabled() and 'on' or 'off')));
         if alltime_db ~= nil then
             local st = alltime_db.status();
             print(chat.header('mobparser') .. chat.message(string.format(
-                'database: %s, %d written this session, %d gear state(s), %d pending write(s), %d bad line(s) skipped. Folder: %s%s%s',
-                st.loaded and (tostring(st.events) .. ' event(s) loaded') or 'events not loaded yet (click All time)',
-                st.writtenThisSession, st.gearStates, st.pending, st.badLines, tostring(st.dir),
+                'database: %s, %d written this session, %d gear state(s), %d pending write(s), %d bad line(s) skipped%s. Folder: %s%s%s',
+                st.loaded and (tostring(st.events) .. ' event(s) loaded')
+                    or (st.loading and 'loading all time...' or 'events not loaded yet (click All time)'),
+                st.writtenThisSession, st.gearStates, st.pending, st.badLines,
+                ((st.dropped or 0) > 0) and string.format(', %d UNWRITTEN line(s) dropped (writes failing)', st.dropped) or '',
+                tostring(st.dir),
                 st.lastError and ('. Last error: ' .. st.lastError) or '',
                 export_log.persistError() and ('. Record error: ' .. export_log.persistError()) or '')));
+        end
+        if party_saves ~= nil then
+            local ps = party_saves.status();
+            print(chat.header('mobparser') .. chat.message(string.format(
+                'party saves: %d on disk, %d being written. Folder: %s%s',
+                ps.saves, ps.pending, tostring(ps.dir),
+                ps.lastError and ('. Last error: ' .. ps.lastError) or '')));
         end
 
     elseif sub == 'export' then
@@ -473,44 +511,12 @@ ashita.events.register('command', 'mobparser_command', function(e)
         local _, msg = doExport();
         print(chat.header('mobparser') .. chat.message(msg));
 
-    elseif sub == 'save' then
-        if masterExportPath == nil then
-            -- Should not normally happen (load's own handler sets this
-            -- before the command handler could plausibly fire), but
-            -- guarded explicitly rather than passing nil into
-            -- io.open() and getting a confusing lower-level error --
-            -- same "fail with a clear message, don't let an unclear
-            -- error propagate" discipline as the rest of this project.
-            print(chat.header('mobparser') .. chat.message(
-                'save failed: master export path not yet set (has the addon finished loading?)'));
-        else
-            local ok, msg = export_log.saveToMasterAndWipe(masterExportPath);
-            print(chat.header('mobparser') .. chat.message(
-                (ok and 'save succeeded: ' or 'save FAILED: ') .. msg));
-        end
-
-    elseif sub == 'setchatlogs' then
-        -- Sets AND PERSISTS unknownlog's chatlogsDir via
-        -- mobparser_settings.lua (2026-07-29) -- the real replacement
-        -- for the removed hardcoded testing default. Joins the
-        -- remaining args back together (rather than just args[3]) so a
-        -- path containing spaces still works, matching how the rest of
-        -- this file already reconstructs multi-word args nowhere else
-        -- -- this is the first command here that needs it.
-        local path = table.concat(args, ' ', 3);
-        if path == '' then
-            print(chat.header('mobparser') .. chat.message(
-                'usage: /mobparser setchatlogs <path> -- sets and saves the ' ..
-                'chat logger output directory used for chat correlation.'));
-        else
-            unknownlog.setChatlogsDir(path);
-            mobparser_settings.data.chatlogsDir = path;
-            local saved = mobparser_settings.save();
-            print(chat.header('mobparser') .. chat.message(
-                (saved and 'chatlogsDir set and saved: ' or
-                    'chatlogsDir set for this session, but SAVE FAILED (will not persist across reloads): ')
-                .. path));
-        end
+    -- REMOVED (2026-10-30, at Brad's request): `/mobparser save`. It read,
+    -- decoded and rewrote the whole mobparser_export.json on the game thread
+    -- (a freeze that grew with the file), and the all-time database (db\)
+    -- plus `/mobparser export` now cover what it did. `/mobparser save` now
+    -- just shows the usage line. An existing mobparser_export.json is left
+    -- on disk untouched.
 
     elseif sub == 'report' then
         -- 2026-10-29: print the Player view to chat. /mobparser report
@@ -538,9 +544,7 @@ ashita.events.register('command', 'mobparser_command', function(e)
             -- The former load-time diagnostics, shown on demand only.
             print(chat.header('mobparser') .. chat.message(
                 'settings file: ' .. tostring(mobparser_settings.path()) ..
-                ' | addon.path: ' .. tostring(addon.path) ..
-                ' | master export: ' .. tostring(masterExportPath) ..
-                ' | chatlogsDir: ' .. tostring(unknownlog.settings.chatlogsDir)));
+                ' | addon.path: ' .. tostring(addon.path)));
         else
             print(chat.header('mobparser') .. chat.message('debug log OFF.'));
         end
@@ -553,6 +557,11 @@ ashita.events.register('command', 'mobparser_command', function(e)
             print(chat.header('mobparser') .. chat.message(
                 'GUI unavailable (failed to load at /addon load time -- check the ' ..
                 'earlier chat message for the error).'));
+        elseif guiSuspended then
+            -- (2026-10-30) turned off after repeated render errors -- retry
+            guiSuspended = false;
+            guiErrorStreak = 0;
+            print(chat.header('mobparser') .. chat.message('GUI turned back on.'));
         else
             mobparser_gui.toggle();
             print(chat.header('mobparser') .. chat.message(
@@ -562,45 +571,58 @@ ashita.events.register('command', 'mobparser_command', function(e)
     else
         -- Also covers `/mobparser help`.
         print(chat.header('mobparser') .. chat.message(
-            'usage: /mobparser export | wipe | save | status | gui | report [say|party|linkshell] | debug [on|off] | setchatlogs <path>'));
+            'usage: /mobparser export | wipe | status | gui | report [say|party|linkshell] | debug [on|off]'));
     end
 end);
 
 -- ===========================================================================
--- Live export tick (2026-07-30). mobparser had no existing d3d_present
--- registration, so this is a new hook, not a merge into one -- see
--- live_export.lua's own header for what tick() does. Safe to call
--- unconditionally every frame: tick() self-throttles internally
--- (event-count check first, 250ms coalescing window second), so the
--- expensive path (json_encode + io write) only runs when there's
--- genuinely new data and enough time has passed.
+-- Per-frame hook: flushes the all-time database and renders the GUI.
 -- ===========================================================================
 ashita.events.register('d3d_present', 'mobparser_present', function()
-    -- (2026-10-30) live_export.tick() removed -- see the require note
-    -- near the top of this file.
-
     if alltime_db ~= nil then
         local okT, errT = pcall(alltime_db.tick);
         if not okT then
-            print(chat.header('mobparser') .. chat.message('database flush error: ' .. tostring(errT)));
+            reportError('database flush error: ', errT); -- throttled (2026-10-30)
+        end
+    end
+    -- (2026-10-31) party saves: writes queued saves / loads a picked one,
+    -- a slice per frame.
+    if party_saves ~= nil then
+        local okP, errP = pcall(party_saves.tick, (export_log.stats()));
+        if not okP then
+            reportError('party save error: ', errP);
         end
     end
 
     -- GUI render (2026-07-30). pcall-guarded per frame -- an error
-    -- inside imgui drawing must not take down live_export.tick
+    -- inside imgui drawing must not take down the database flush
     -- above, which has already run by this point regardless. Only calls .render() when the module actually
     -- loaded (mobparser_gui ~= nil, see the pcall(require, ...) guard
     -- near the top of this file).
-    if mobparser_gui ~= nil then
+    if mobparser_gui ~= nil and not guiSuspended then
         local rOk, rErr = pcall(mobparser_gui.render);
         if not rOk then
-            print(chat.header('mobparser') .. chat.message(
-                'GUI render error: ' .. tostring(rErr)));
+            reportError('GUI render error: ', rErr); -- throttled (2026-10-30)
+            guiErrorStreak = guiErrorStreak + 1;
+            if guiErrorStreak >= GUI_MAX_CONSECUTIVE_ERRORS then
+                guiSuspended = true;
+                print(chat.header('mobparser') .. chat.message(string.format(
+                    'GUI turned off after %d errors in a row (capture keeps running). ' ..
+                    '/mobparser gui to try again.', guiErrorStreak)));
+            end
+        else
+            guiErrorStreak = 0;
         end
     end
 end);
 
 ashita.events.register('unload', 'mobparser_unload', function()
     if alltime_db ~= nil then pcall(alltime_db.flush); end
+    -- (2026-10-31) the session is discarded on unload too: save it, and
+    -- write everything still queued now.
+    if party_saves ~= nil then
+        pcall(party_saves.capture, export_log.snapshot(), 'unload');
+        pcall(party_saves.finishAll);
+    end
     print(chat.header('mobparser') .. chat.message('unloaded.'));
 end);

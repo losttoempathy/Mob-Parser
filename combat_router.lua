@@ -184,18 +184,6 @@ combat_router.EVENT_TYPE_BY_CATEGORY = {
 -- PURE LOGIC -- no Ashita dependency, fully testable offline.
 -- ===========================================================================
 
--- 2026-10-29: job-ability outcomes that show up on CATEGORY 3 on
--- AscensionXI and should export as 'job_ability', not 'weaponskill'.
--- Evidence: 5 Steal events in the 2026-10-28 capture, all category 3.
--- Mug is included as Steal's sibling THF ability (same message family);
--- nothing else is re-typed -- see the call site for why.
-combat_router.JA_OUTCOMES_ON_WS_CATEGORY = {
-    [classify.OUTCOME.JA_STEAL_SUCCESS] = true,
-    [classify.OUTCOME.JA_STEAL_FAIL]    = true,
-    [classify.OUTCOME.JA_MUG_SUCCESS]   = true,
-    [classify.OUTCOME.JA_MUG_FAIL]      = true,
-};
-
 -- 2026-10-29: fields classify.* may return in its 3rd value for a
 -- KNOWN outcome, lifted to top-level export fields so consumers don't
 -- dig through `raw`. These all replace a param that used to be
@@ -432,10 +420,32 @@ local MAX_ENTITY_INDEX = 2304; -- UNVERIFIED, see note above
 -- AshitaCore access is ever genuinely needed inside combat_router.lua
 -- again, that open question would need real investigation, not
 -- another assumption).
+-- PERF (2026-10-30): serverId -> entity index cache. A cached index is
+-- re-checked (the entity there must still carry the same ServerId) before
+-- it is trusted, so a despawn/respawn into that slot can never return the
+-- wrong entity -- a stale entry just falls through to the full scan.
+-- Misses are deliberately NOT cached: after the handlePacket early-out
+-- below, this only runs for packets that involve you, and caching a miss
+-- could drop a real hit from a mob whose entity hadn't loaded yet.
+-- Cleared on zone (combat_router.onZone).
+local entityIndexCache = {};
+
 local function findEntityByServerId(serverId)
+    if serverId == nil or serverId == 0 then
+        return nil;
+    end
+    local cachedIndex = entityIndexCache[serverId];
+    if cachedIndex ~= nil then
+        local entity = GetEntity(cachedIndex);
+        if entity ~= nil and entity.ServerId == serverId then
+            return entity;
+        end
+        entityIndexCache[serverId] = nil; -- stale -- rescan below
+    end
     for index = 0, MAX_ENTITY_INDEX do
         local entity = GetEntity(index);
         if entity ~= nil and entity.ServerId == serverId then
+            entityIndexCache[serverId] = index;
             return entity;
         end
     end
@@ -727,11 +737,7 @@ local SLOT_ORDER = {
 -- "newest worn, full stop" lookup -- per the design decision that
 -- melee has no dlac-side action anchor to join against at all (see
 -- dlac_listener.lua's own currentComposition comment for the full
--- reasoning). If/when mobparser extends to WS/spell/ability categories
--- (out of v1 scope, see V1_SCOPED_CATEGORIES), THOSE calls should use
--- dlac_listener.compositionFor(state, actionId, actionCategory)
--- instead -- do not reuse this function for that case without
--- reconsidering which lookup is correct, they are not interchangeable.
+-- reasoning).
 --
 -- HISTORY (2026-07-28, both changes same day): originally emitted only
 -- Main+Ammo (an unjustified scoping assumption, corrected above).
@@ -779,13 +785,35 @@ local EQUIP_SLOT_ID = {
     Main = 0, Sub = 1, Range = 2, Ammo = 3, Head = 4, Body = 5, Hands = 6, Legs = 7,
     Feet = 8, Neck = 9, Waist = 10, Ear1 = 11, Ear2 = 12, Ring1 = 13, Ring2 = 14, Back = 15,
 };
-combat_router.EQUIP_SLOT_ID = EQUIP_SLOT_ID;
 
 local memItemNameCache = {};
 
 -- Returns slot -> {name=, id=} for readable worn slots, slot -> false for
 -- slots memory says are EMPTY, and leaves unreadable slots absent.
 -- Returns nil if memory can't be read at all (zoning, no inventory).
+-- PERF (2026-10-30): one shared function instead of a new closure per
+-- slot per call (was 16 closures per read).
+local function readEquippedSlot(inv, res, sid)
+    local eq = inv:GetEquippedItem(sid);
+    if eq == nil or eq.Index == nil then return nil; end -- unreadable
+    local packed = eq.Index;
+    if packed == 0 then return false; end -- nothing equipped
+    local cont = bit.rshift(bit.band(packed, 0xFF00), 8);
+    local idx = bit.band(packed, 0x00FF);
+    local ci = inv:GetContainerItem(cont, idx);
+    if ci == nil or ci.Id == nil then return nil; end
+    local id = ci.Id;
+    if id == 0 or id == 65535 then return false; end
+    local name = memItemNameCache[id];
+    if name == nil then
+        local item = res:GetItemById(id);
+        name = item and item.Name and item.Name[1];
+        if type(name) ~= 'string' or name == '' then return nil; end
+        memItemNameCache[id] = name;
+    end
+    return { name = name, id = id };
+end
+
 function combat_router.ashita.readEquippedFromMemory()
     if AshitaCore == nil then return nil; end
     local mm = AshitaCore:GetMemoryManager();
@@ -794,26 +822,7 @@ function combat_router.ashita.readEquippedFromMemory()
     if inv == nil or res == nil then return nil; end
     local out = {};
     for slot, sid in pairs(EQUIP_SLOT_ID) do
-        local ok, val = pcall(function()
-            local eq = inv:GetEquippedItem(sid);
-            if eq == nil or eq.Index == nil then return nil; end -- unreadable
-            local packed = eq.Index;
-            if packed == 0 then return false; end -- nothing equipped
-            local cont = bit.rshift(bit.band(packed, 0xFF00), 8);
-            local idx = bit.band(packed, 0x00FF);
-            local ci = inv:GetContainerItem(cont, idx);
-            if ci == nil or ci.Id == nil then return nil; end
-            local id = ci.Id;
-            if id == 0 or id == 65535 then return false; end
-            local name = memItemNameCache[id];
-            if name == nil then
-                local item = res:GetItemById(id);
-                name = item and item.Name and item.Name[1];
-                if type(name) ~= 'string' or name == '' then return nil; end
-                memItemNameCache[id] = name;
-            end
-            return { name = name, id = id };
-        end);
+        local ok, val = pcall(readEquippedSlot, inv, res, sid);
         if ok and val ~= nil then out[slot] = val; end
     end
     return out;
@@ -903,6 +912,10 @@ end
 ---                              working with dlac's addon absent, per the
 ---                              project's original one-way, no-load-dependency
 ---                              design between mobparser and its data sources.
+-- Animation -> hand, melee only (see the hand note inside handlePacket).
+-- File scope since 2026-10-30 (was rebuilt for every target).
+local HAND_BY_ANIMATION = { [0] = 'main', [1] = 'sub', [2] = 'other', [3] = 'other', [4] = 'other' };
+
 function combat_router.handlePacket(packetId, packetData, dlacState)
     if packetId ~= 0x028 then
         return;
@@ -947,7 +960,11 @@ function combat_router.handlePacket(packetId, packetData, dlacState)
     -- results should still be treated as "needs in-game verification,"
     -- not blindly trusted -- which is the whole point of this test.
     local actorIsTrackedPlayerOrPet = combat_router.ashita.isTrackedPlayerOrPet(action.actor_id);
-    local actorIsMonster = combat_router.ashita.isMonster(action.actor_id);
+    -- PERF (2026-10-30): isMonster is now LAZY -- only asked when the actor
+    -- is not you/your party AND the target is you (the only case where
+    -- determineSide reads it). Was computed for every action packet in the
+    -- zone, including other parties' fights that are thrown away.
+    local actorIsMonster = nil;
 
     -- Party member data collection (2026-07-29 expansion): resolves
     -- once per action, not per target -- "who the actor is" doesn't
@@ -972,54 +989,77 @@ function combat_router.handlePacket(packetId, packetData, dlacState)
     -- 2026-10-29: plain entity name for the actor (mob / anyone), kept in
     -- its OWN field so actorName keeps meaning "party member". pcall'd so
     -- a lookup failure can never break capture.
-    local okAN, actorEntityName = pcall(combat_router.ashita.entityName, action.actor_id);
-    if not okAN then actorEntityName = nil; end
+    -- PERF (2026-10-30): actor name is now resolved lazily, on the first
+    -- target that is actually kept (see the early-out in the loop below).
+    local actorEntityName = nil;
+    local actorNameResolved = false;
 
     -- (2026-10-29: the temporary resprobe.lua hook that used to sit here
     -- is retired -- its findings are now implemented in action_names.lua.)
+    -- PERF (2026-10-30): requires hoisted out of the per-target loop.
     local action_names = require('action_names');
+    local debug_log = require('debug_log');
+    local export_log = require('export_log');
+
+    local actorOffense = actorIsTrackedPlayerOrPet or actorIsPartyOrPartyPet;
+
+    -- PERF (2026-10-30): gear read ONCE per action (was once per target --
+    -- an AoE read all 16 slots again for every mob it hit), and only when
+    -- the gear is yours: your own / your pet's actions, and anything that
+    -- targets you (defense -- your DEF/EVA gear matters there). Party
+    -- members' actions no longer get YOUR gear stamped on them (it never
+    -- described their gear -- see the gearStateId note below); they get
+    -- the shared "no gear data" state instead.
+    local wornFetched, worn, gearStatus = false, nil, nil;
+    local gearTagBuilt, gearTag = false, nil;
 
     for _, target in ipairs(action.targets) do
         local targetIsTrackedPlayerOrPet = combat_router.ashita.isTrackedPlayerOrPet(target.id);
         local actorEqualsTarget = (action.actor_id == target.id);
 
-        local side = combat_router.determineSide(
-            actorIsTrackedPlayerOrPet or actorIsPartyOrPartyPet, actorIsMonster,
-            targetIsTrackedPlayerOrPet, actorEqualsTarget);
+        -- PERF (2026-10-30) EARLY-OUT: determineSide can only return
+        -- non-nil when the actor is you/party (offense) or the target is
+        -- you (defense). Anything else is someone else's fight -- skip it
+        -- before any entity scan, name lookup or gear read.
+        local side = nil;
+        if actorOffense or targetIsTrackedPlayerOrPet then
+            if not actorOffense and actorIsMonster == nil then
+                actorIsMonster = combat_router.ashita.isMonster(action.actor_id);
+            end
+            side = combat_router.determineSide(
+                actorOffense, actorIsMonster or false,
+                targetIsTrackedPlayerOrPet, actorEqualsTarget);
+        end
 
+        if side ~= nil then
         local perTargetResults = combat_router.route(
             { category = action.category, targets = { target } }, side);
+
+        if not actorNameResolved then
+            actorNameResolved = true;
+            local okAN, n = pcall(combat_router.ashita.entityName, action.actor_id);
+            if okAN then actorEntityName = n; end
+        end
 
         -- 2026-10-29: target's entity name (the mob, on offense) -- lets the
         -- export aggregate job > mob by name without an ID lookup later.
         local okTN, targetName = pcall(combat_router.ashita.entityName, target.id);
         if not okTN then targetName = nil; end
 
-        -- gearTag/worn built ONCE per target/action here rather than
-        -- once per individual result, since "what was worn" doesn't
-        -- vary across the (main-hand hit, off-hand hit, add-effect)
-        -- results of a single action -- no reason to redo the same
-        -- lookup for each.
-        local worn, gearStatus = currentGearWorn(dlacState);
+        if not wornFetched then
+            wornFetched = true;
+            if actorIsTrackedPlayerOrPet or side == 'defense' then
+                worn, gearStatus = currentGearWorn(dlacState);
+            end
+        end
 
-        -- debug_log.lua: still-active testing diagnostic (see its own
-        -- header for retirement status), kept alongside export_log
-        -- below for quick human sanity-checking against Metrics. Not
-        -- the real data pipeline -- don't extend it further.
-        local debug_log = require('debug_log');
-        local gearTag = buildGearTag(worn, gearStatus);
-
-        -- export_log.lua: the REAL data pipeline under the 2026-07-28
-        -- scope pivot (see mobparser_PROJECT.md "SCOPE PIVOT" section).
-        -- Every classified result becomes one exported event, gear-
-        -- stamped via export_log's own interning (dedup handled
-        -- entirely inside export_log.record -- this call site doesn't
-        -- need to think about it). `worn` is passed through as-is
-        -- (possibly nil, e.g. dlac not installed/streaming) --
-        -- export_log.record's own contract handles that case (assigns
-        -- the shared "no gear data" id) without this call site needing
-        -- a branch for it.
-        local export_log = require('export_log');
+        -- debug_log.lua: still-active testing diagnostic. PERF
+        -- (2026-10-30): the 16-slot gear signature string is only built
+        -- while the debug log is actually on.
+        if not gearTagBuilt and debug_log.isEnabled() then
+            gearTagBuilt = true;
+            gearTag = buildGearTag(worn, gearStatus);
+        end
 
         -- type resolution (2026-07-29, gap 1 fix): melee (category 1)
         -- previously always exported as the single string 'melee'
@@ -1067,7 +1107,7 @@ function combat_router.handlePacket(packetId, packetData, dlacState)
         -- Daken are structurally parsed but NOT YET observed in a real
         -- capture as of this writing -- downstream consumers should
         -- treat 'sub' attribution as unconfirmed until that happens.
-        local HAND_BY_ANIMATION = { [0] = 'main', [1] = 'sub', [2] = 'other', [3] = 'other', [4] = 'other' };
+        -- (HAND_BY_ANIMATION now lives at file scope -- PERF 2026-10-30.)
 
         -- actionId (2026-10-29): which ability/spell/WS/TP move this was.
         -- The export had NO way to tell one job ability from another (256
@@ -1277,7 +1317,14 @@ function combat_router.handlePacket(packetId, packetData, dlacState)
                 export_log.record(aeFields);
             end
         end
+        end -- if side ~= nil (PERF early-out, 2026-10-30)
     end
+end
+
+-- Zone change (2026-10-30): entity indexes are per zone, so the
+-- serverId -> index cache is dropped. Called from mobparser.lua on 0x00A.
+function combat_router.onZone()
+    entityIndexCache = {};
 end
 
 return combat_router;

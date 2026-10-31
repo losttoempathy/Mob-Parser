@@ -85,6 +85,10 @@ local settings = require('mobparser_settings');
 -- if it failed to load.
 local dbOk, alltime_db = pcall(require, 'alltime_db');
 if not dbOk then alltime_db = nil; end
+-- Party saves (2026-10-31). Optional: the Saves dropdown is hidden if it
+-- failed to load.
+local psOk, party_saves = pcall(require, 'party_saves');
+if not psOk then party_saves = nil; end
 
 local mobparser_gui = {};
 
@@ -163,6 +167,11 @@ local DPS_IDLE_GAP = 10;
 
 -- 2026-10-29: ranged and weaponskill outcomes added -- the main table's
 -- Hits / Misses / Crits / Acc used to count melee only.
+-- (2026-10-30) These are the only hit/miss sets; classify.lua's unused
+-- copies were removed. Rules carried over from there: SHADOWS, PARRY,
+-- GUARD, SHIELD_BLOCK, COUNTER and MOB_HEAL all passed the accuracy roll,
+-- so they count as hits (PARRY confirmed by Brad 2026-07-27). DODGE
+-- (Perfect Dodge) is in neither set -- not an accuracy roll.
 local COUNTS_AS_HIT = {
     HIT = true, CRIT = true, SHADOWS = true, GUARD = true,
     SHIELD_BLOCK = true, UNMITIGATED = true, COUNTER = true,
@@ -193,7 +202,8 @@ local state = {
     sortKey    = 'damage',    -- column key currently sorted on (nil = first-seen order)
     sortAsc    = false,       -- false = high->low
     isolated   = nil,         -- row key (player name) shown in isolation mode; nil = full list
-    source     = 'session',   -- 'session' or 'alltime' (2026-10-30)
+    source     = 'session',   -- 'session', 'alltime' (2026-10-30) or 'save' (2026-10-31)
+    saveFile   = nil,         -- party save shown when source == 'save'
     wf         = {},          -- isolation weapon filter (see computeIsolation)
     mf         = nil,         -- isolation monster filter (see computeIsolation)
     jf         = nil,         -- isolation job filter: nil = all jobs, else 'WAR' etc.
@@ -209,59 +219,113 @@ local function useAllTime()
     return state.source == 'alltime' and alltime_db ~= nil and alltime_db.isLoaded();
 end
 
+-- (2026-10-31) a party save, once it has finished loading
+local function useSave()
+    return state.source == 'save' and party_saves ~= nil and state.saveFile ~= nil
+        and party_saves.loadedFile() == state.saveFile;
+end
+
+-- A save picked but still loading shows nothing (not the live session).
+local EMPTY_EVENTS = {};
+
 local function currentEvents()
+    if useSave() then return party_saves.events(); end
+    if state.source == 'save' then return EMPTY_EVENTS; end
     if useAllTime() then return alltime_db.events(); end
     return export_log.liveEvents();
 end
 
 -- entry ({id, Main=name, ...}), weaponIds ({Main=itemId, ...}) or nil
 local function gearLookup(id)
+    if useSave() then return party_saves.gearState(id); end
     if useAllTime() then return alltime_db.gearState(id); end
     if export_log.gearState ~= nil then return export_log.gearState(id); end
     return nil, nil;
 end
 
 local function gearLookupAvailable()
-    if useAllTime() then return true; end
+    if useSave() or useAllTime() then return true; end
     return export_log.gearState ~= nil;
 end
 
-local function dataStamp()
-    if useAllTime() then return 'A' .. tostring(alltime_db.version()); end
-    local gen = export_log.generation ~= nil and export_log.generation() or 0;
-    return 'S' .. tostring(gen) .. ':' .. tostring(#export_log.liveEvents());
+-- ---------------------------------------------------------------------------
+-- PERF (2026-10-30, low-end machines). Replaces the per-frame string
+-- "data stamp" cache.
+--   * The event list only ever GROWS (append-only) until it is replaced
+--     outright (wipe, session trim, All time load) -- so "same table, more
+--     events" means "fold in the new ones", and "different table" means
+--     "start over". No strings are built per frame to check this.
+--   * Main table: incremental -- each refresh only processes events added
+--     since the last one (was: re-walk + re-sort everything every 0.5 s /
+--     2 s).
+--   * Isolation: cannot be incremental (mob numbering 'Crab #1/#2' and
+--     party detection depend on ALL events, so earlier lines can change
+--     when later events arrive). It is rebuilt exactly as before, but as a
+--     coroutine that runs at most SLICE_BUDGET seconds per frame; the
+--     previous result stays on screen until the new one is ready.
+--   * Any big first build (e.g. the main table right after All time loads)
+--     is sliced the same way.
+-- ---------------------------------------------------------------------------
+local REFRESH_SECONDS = 0.5;  -- fold new events in at most this often
+local SLICE_BUDGET = 0.003;   -- seconds of aggregation work per frame
+
+local sliceDeadline = nil;    -- set only while a sliced coroutine runs
+local sliceCounter = 0;
+-- Called inside long loops. Yields back to the frame when the slice budget
+-- is used up. A no-op outside a sliced coroutine (e.g. offline tests).
+local function sliceCheck()
+    if sliceDeadline == nil then return; end
+    sliceCounter = sliceCounter + 1;
+    if sliceCounter < 64 then return; end
+    sliceCounter = 0;
+    if os.clock() >= sliceDeadline then coroutine.yield(); end
 end
 
--- Aggregation cache (2026-10-30): tables are only rebuilt when the data or
--- the parameters change, not every frame. Session data refreshes
--- immediately; all-time data at most every ALLTIME_REFRESH seconds.
--- 2026-10-30: session data now at most every SESSION_REFRESH seconds too --
--- a busy party fight adds events most frames, and each refresh re-walks
--- the whole session. A wipe (generation change) or a filter/view change
--- still refreshes at once.
-local ALLTIME_REFRESH = 2;
-local SESSION_REFRESH = 0.5;
-local aggCache = {};
+-- Combat time for DPS without sorting (2026-10-30, perf). Gives exactly the
+-- same answer as sorting every timestamp and summing the gaps (a gap over
+-- DPS_IDLE_GAP counts as 1 s), but each event costs O(1): timestamps are
+-- whole seconds, so only the distinct seconds matter, and an out-of-order
+-- second only needs its neighbours within DPS_IDLE_GAP looked up.
+local function newCombatClock()
+    return { seen = {}, min = nil, max = nil, total = 0, inexact = false };
+end
 
-local function cached(slot, paramKey, build)
-    local stamp = dataStamp();
-    local now = os.clock();
-    local c = aggCache[slot];
-    if c ~= nil and c.paramKey == paramKey then
-        if c.stamp == stamp then return c.a, c.b; end
-        if stamp:sub(1, 1) == 'A' and c.stamp:sub(1, 1) == 'A' and (now - c.at) < ALLTIME_REFRESH then
-            return c.a, c.b;
+local function gapValue(g)
+    if g > DPS_IDLE_GAP then return 1; end
+    return g;
+end
+
+local function combatClockAdd(c, t)
+    if type(t) ~= 'number' then return; end
+    if t ~= math.floor(t) then c.inexact = true; return; end
+    if c.seen[t] then return; end
+    c.seen[t] = true;
+    if c.min == nil then
+        c.min, c.max, c.total = t, t, 1;
+        return;
+    end
+    if t > c.max then
+        c.total = c.total + gapValue(t - c.max); c.max = t;
+    elseif t < c.min then
+        c.total = c.total + gapValue(c.min - t); c.min = t;
+    else
+        -- strictly inside: replace gap (a,b) with (a,t)+(t,b)
+        local a, b = nil, nil;
+        for d = 1, DPS_IDLE_GAP do
+            if a == nil and c.seen[t - d] then a = t - d; end
+            if b == nil and c.seen[t + d] then b = t + d; end
+            if a ~= nil and b ~= nil then break; end
         end
-        -- Session: same generation (no wipe since) -> only new events; throttle.
-        if stamp:sub(1, 1) == 'S' and c.stamp:sub(1, 1) == 'S'
-            and stamp:match('^S(%d+):') == c.stamp:match('^S(%d+):')
-            and (now - c.at) < SESSION_REFRESH then
-            return c.a, c.b;
+        if a ~= nil and b ~= nil then
+            c.total = c.total + gapValue(t - a) + gapValue(b - t) - gapValue(b - a);
+        elseif a ~= nil then
+            c.total = c.total + gapValue(t - a);   -- (t,b) and (a,b) both count 1
+        elseif b ~= nil then
+            c.total = c.total + gapValue(b - t);
+        else
+            c.total = c.total + 1;
         end
     end
-    local a, b = build();
-    aggCache[slot] = { paramKey = paramKey, stamp = stamp, a = a, b = b, at = now };
-    return a, b;
 end
 
 for k in pairs(DEFAULT_DISPLAY_ON) do state.displayOn[k] = true; end
@@ -345,8 +409,10 @@ local function rowKeyFor(e, groupField)
     return key, isMob, job;
 end
 
--- Combat time for DPS (see DPS_IDLE_GAP above).
-local function computeCombatSeconds(events)
+-- Combat time for DPS (see DPS_IDLE_GAP above). Original sort-based
+-- version -- now only a fallback for non-whole-second timestamps (none are
+-- written today: export_log stamps os.time()).
+local function computeCombatSecondsSorted(events)
     local times = {};
     for _, e in ipairs(events) do
         if type(e.timestamp) == 'number' then table.insert(times, e.timestamp); end
@@ -365,75 +431,95 @@ local function computeCombatSeconds(events)
     return combatSeconds;
 end
 
-local function computeRowsUncached(groupField)
-    local rows = {};      -- name -> row table
-    local order = {};     -- preserves first-seen order
-
-    local events = currentEvents();
+-- Same result, no sort (see newCombatClock). Sliced-coroutine aware.
+local function computeCombatSeconds(events)
+    local c = newCombatClock();
     for _, e in ipairs(events) do
-        local name, isMob, job = rowKeyFor(e, groupField);
-        -- 2026-10-30: one row per player per job (Lift WAR / Lift MNK are
-        -- separate rows). Mobs, pets and job-less events keep one row.
-        local key = name;
-        if job ~= nil then key = name .. '\t' .. job; end
-        local r = rows[key];
-        if r == nil then
-            r = { name = name, job = job, isMob = isMob };
-            rows[key] = r;
-            table.insert(order, key);
-        end
-
-        local outcome = e.outcome or '';
-        local dmg = type(e.damage) == 'number' and e.damage or 0;
-        local isHit = COUNTS_AS_HIT[outcome] == true;
-        local isMiss = COUNTS_AS_MISS[outcome] == true;
-        -- heal amounts are not damage
-        if HEAL_OUTCOMES[outcome] then dmg = 0; end
-
-        bump(r, 'events');
-        if isHit then bump(r, 'hits'); end
-        if isMiss then bump(r, 'misses'); end
-        if COUNTS_AS_CRIT[outcome] then bump(r, 'crits'); end
-        addDmg(r, 'damage', dmg);
-
-        if outcome == 'PARRY' then bump(r, 'parry'); end
-        if outcome == 'GUARD' then bump(r, 'guard'); end
-        if outcome == 'SHIELD_BLOCK' then bump(r, 'shieldBlock'); end
-        if outcome == 'SHADOWS' then bump(r, 'shadows'); end
-        if outcome == 'DODGE' then bump(r, 'dodge'); end
-        if outcome == 'COUNTER' then bump(r, 'counter'); end
-
-        if e.type == 'weaponskill' and outcome ~= 'TOO_FAR' then -- too far = WS never went off
-            bump(r, 'wsCount');
-            addDmg(r, 'wsDamage', dmg);
-            if isMiss then bump(r, 'wsMiss'); end -- MISS / WS_NO_EFFECT
-        end
-        if e.type == 'magic' then
-            bump(r, 'magicCount');
-            addDmg(r, 'magicDamage', dmg);
-            if outcome == 'MAGIC_RESIST' then bump(r, 'magicResist'); end
-            if outcome == 'MAGIC_HEAL' then bump(r, 'magicHeal'); end
-        end
-        if outcome:sub(1, 3) == 'JA_' then
-            bump(r, 'jaCount');
-            if outcome == 'JA_DAMAGE' then addDmg(r, 'jaDamage', dmg); end
-        end
-        if e.type == 'pet_melee' then bump(r, 'petMelee'); end
-        if outcome:sub(1, 12) == 'PET_TP_MOVE' then bump(r, 'petTpMove'); end
-        if outcome == 'SKILLCHAIN' then bump(r, 'skillchain'); end
-        if outcome == 'UNKNOWN' or outcome == 'UNKNOWN_ADD_EFFECT' then bump(r, 'unknown'); end
+        combatClockAdd(c, e.timestamp);
+        sliceCheck();
     end
+    if c.inexact then return computeCombatSecondsSorted(events); end
+    return c.total;
+end
+
+-- One event into the main-table rows. Body unchanged from the old
+-- computeRowsUncached loop (2026-10-30 split out so it can run
+-- incrementally).
+local function accumulateRow(c, e, groupField)
+    local rows, order = c.rows, c.order;
+    local name, isMob, job = rowKeyFor(e, groupField);
+    -- 2026-10-30: one row per player per job (Lift WAR / Lift MNK are
+    -- separate rows). Mobs, pets and job-less events keep one row.
+    local key = name;
+    if job ~= nil then key = name .. '\t' .. job; end
+    local r = rows[key];
+    if r == nil then
+        r = { name = name, job = job, isMob = isMob };
+        rows[key] = r;
+        table.insert(order, key);
+    end
+
+    local outcome = e.outcome or '';
+    local dmg = type(e.damage) == 'number' and e.damage or 0;
+    local isHit = COUNTS_AS_HIT[outcome] == true;
+    local isMiss = COUNTS_AS_MISS[outcome] == true;
+    -- heal amounts are not damage
+    if HEAL_OUTCOMES[outcome] then dmg = 0; end
+
+    bump(r, 'events');
+    if isHit then bump(r, 'hits'); end
+    if isMiss then bump(r, 'misses'); end
+    if COUNTS_AS_CRIT[outcome] then bump(r, 'crits'); end
+    addDmg(r, 'damage', dmg);
+
+    if outcome == 'PARRY' then bump(r, 'parry'); end
+    if outcome == 'GUARD' then bump(r, 'guard'); end
+    if outcome == 'SHIELD_BLOCK' then bump(r, 'shieldBlock'); end
+    if outcome == 'SHADOWS' then bump(r, 'shadows'); end
+    if outcome == 'DODGE' then bump(r, 'dodge'); end
+    if outcome == 'COUNTER' then bump(r, 'counter'); end
+
+    if e.type == 'weaponskill' and outcome ~= 'TOO_FAR' then -- too far = WS never went off
+        bump(r, 'wsCount');
+        addDmg(r, 'wsDamage', dmg);
+        if isMiss then bump(r, 'wsMiss'); end -- MISS / WS_NO_EFFECT
+    end
+    if e.type == 'magic' then
+        bump(r, 'magicCount');
+        addDmg(r, 'magicDamage', dmg);
+        if outcome == 'MAGIC_RESIST' then bump(r, 'magicResist'); end
+        if outcome == 'MAGIC_HEAL' then bump(r, 'magicHeal'); end
+    end
+    if outcome:sub(1, 3) == 'JA_' then
+        bump(r, 'jaCount');
+        if outcome == 'JA_DAMAGE' then addDmg(r, 'jaDamage', dmg); end
+    end
+    if e.type == 'pet_melee' then bump(r, 'petMelee'); end
+    if outcome:sub(1, 12) == 'PET_TP_MOVE' then bump(r, 'petTpMove'); end
+    if outcome == 'SKILLCHAIN' then bump(r, 'skillchain'); end
+    if outcome == 'UNKNOWN' or outcome == 'UNKNOWN_ADD_EFFECT' then bump(r, 'unknown'); end
 
     -- combat time for DPS (see DPS_IDLE_GAP above)
+    if state.trackingOn.dps then combatClockAdd(c.clock, e.timestamp); end
+end
+
+-- Derived stats + the row list, after a batch of new events.
+local function finalizeRows(c, events)
     local combatSeconds = 0;
     if state.trackingOn.dps then
-        combatSeconds = computeCombatSeconds(events);
+        if c.clock.inexact then
+            combatSeconds = computeCombatSecondsSorted(events);
+        else
+            combatSeconds = c.clock.total;
+        end
     end
+    c.combatSeconds = combatSeconds;
 
-    -- derived stats
-    for _, key in ipairs(order) do
-        local r = rows[key];
+    local list = {};
+    for _, key in ipairs(c.order) do
+        local r = c.rows[key];
         local hits, misses = r.hits or 0, r.misses or 0;
+        r.acc, r.dps, r.avgDamage = nil, nil, nil;
         if state.trackingOn.acc and (hits + misses) > 0 then
             r.acc = math.floor((hits / (hits + misses)) * 1000 + 0.5) / 10;
         end
@@ -443,26 +529,68 @@ local function computeRowsUncached(groupField)
         if state.trackingOn.avgDamage and hits > 0 then
             r.avgDamage = math.floor(((r.damage or 0) / hits) * 10 + 0.5) / 10;
         end
+        table.insert(list, r);
     end
-
-    local list = {};
-    for _, key in ipairs(order) do table.insert(list, rows[key]); end
-    return list, combatSeconds;
+    c.list = list;
 end
 
+-- Tracking-toggle fingerprint. PERF (2026-10-30): only rebuilds its string
+-- when a toggle actually changed (was a new string every frame).
+local tkSnap, tkStr = {}, nil;
 local function trackingKey()
-    local parts = {};
-    for _, key in ipairs(ALL_STAT_KEYS) do
-        table.insert(parts, state.trackingOn[key] and '1' or '0');
+    if tkStr ~= nil then
+        local same = true;
+        for i, key in ipairs(ALL_STAT_KEYS) do
+            if (state.trackingOn[key] == true) ~= tkSnap[i] then same = false; break; end
+        end
+        if same then return tkStr; end
     end
-    return table.concat(parts);
+    local parts = {};
+    for i, key in ipairs(ALL_STAT_KEYS) do
+        tkSnap[i] = (state.trackingOn[key] == true);
+        parts[i] = tkSnap[i] and '1' or '0';
+    end
+    tkStr = table.concat(parts);
+    return tkStr;
 end
 
--- Cached. The returned list may be re-sorted by the caller (order only).
-local function computeRows(groupField)
-    return cached('rows', groupField .. '|' .. trackingKey(), function()
-        return computeRowsUncached(groupField);
-    end);
+-- Main-table rows, incremental (see the PERF block near the top).
+-- Returns list, combatSeconds, buildId (changes whenever the list does),
+-- building (true while a big first build is still being sliced).
+-- budget: seconds to spend this call (nil = SLICE_BUDGET; math.huge =
+-- finish now, used by Report).
+local rowsCache = {};   -- groupField -> cache
+local rowsBuildId = 0;
+
+local function computeRows(groupField, budget)
+    local events = currentEvents();
+    local n = #events;
+    local tk = trackingKey();
+    local now = os.clock();
+    local c = rowsCache[groupField];
+    if c == nil or c.events ~= events or c.tk ~= tk or n < c.done then
+        c = { events = events, tk = tk, done = 0, rows = {}, order = {}, list = {},
+              clock = newCombatClock(), combatSeconds = 0, at = -math.huge, id = 0 };
+        rowsCache[groupField] = c;
+    end
+    local catchingUp = (c.done < n) and (c.building or c.done == 0
+        or (now - c.at) >= REFRESH_SECONDS or budget == math.huge);
+    if catchingUp then
+        local deadline = now + (budget or SLICE_BUDGET);
+        local i = c.done;
+        while i < n do
+            i = i + 1;
+            accumulateRow(c, events[i], groupField);
+            if i % 64 == 0 and os.clock() >= deadline then break; end
+        end
+        c.done = i;
+        c.building = (i < n) and (budget ~= math.huge);
+        finalizeRows(c, events);
+        c.at = now;
+        rowsBuildId = rowsBuildId + 1;
+        c.id = rowsBuildId;
+    end
+    return c.list, c.combatSeconds, c.id, c.building == true;
 end
 
 -- ===========================================================================
@@ -678,6 +806,7 @@ local function buildEnemyIndex(events)
         table.insert(idOrder, id);
     end
     for _, e in ipairs(events) do
+        sliceCheck(); -- PERF 2026-10-30: lets a sliced rebuild pause here
         if e.actorName ~= nil and e.actorId ~= nil then
             partyIds[e.actorId] = true;
             partyNames[e.actorName] = true;
@@ -836,7 +965,7 @@ local function noteTypeName(opt, typ, name)
 end
 
 -- Cache-key fingerprint for the filters.
-local function filterKey(wf, mf, jf)
+local function filterKeyUncached(wf, mf, jf)
     local function p(x)
         if x == nil then return '-'; end
         if type(x) == 'table' then return tostring(x.type) .. '/' .. tostring(x.name); end
@@ -846,6 +975,39 @@ local function filterKey(wf, mf, jf)
     return table.concat({ p(wf.main), p(wf.sub), p(wf.range), p(wf.ammo),
         mf and (tostring(mf.name) .. '/' .. tostring(mf.id)) or '-',
         jf or '-' }, '|');
+end
+
+-- PERF (2026-10-30): same key, but the string is only rebuilt when one of
+-- its inputs actually changed (was rebuilt every frame in Iso view).
+-- Compared by value, so it is right whether a filter table is replaced or
+-- edited in place.
+local fkSnap, fkStr = {}, nil;
+local EMPTY_WF = {};
+local function pickA(x) if type(x) == 'table' then return x.type; end return x; end
+local function pickB(x) if type(x) == 'table' then return x.name; end return nil; end
+-- writes slot i, returns true if it differed
+local function fkSet(i, val)
+    if fkSnap[i] == val then return false; end
+    fkSnap[i] = val;
+    return true;
+end
+local function filterKey(wf, mf, jf)
+    wf = wf or EMPTY_WF;
+    -- no short-circuit: every slot must be refreshed
+    local d = false;
+    if fkSet(1, jf) then d = true; end
+    if fkSet(2, mf and mf.name) then d = true; end
+    if fkSet(3, mf and mf.id) then d = true; end
+    if fkSet(4, pickA(wf.main)) then d = true; end
+    if fkSet(5, pickB(wf.main)) then d = true; end
+    if fkSet(6, pickA(wf.sub)) then d = true; end
+    if fkSet(7, pickB(wf.sub)) then d = true; end
+    if fkSet(8, pickA(wf.range)) then d = true; end
+    if fkSet(9, pickB(wf.range)) then d = true; end
+    if fkSet(10, pickA(wf.ammo)) then d = true; end
+    if fkSet(11, pickB(wf.ammo)) then d = true; end
+    if d or fkStr == nil then fkStr = filterKeyUncached(wf, mf, jf); end
+    return fkStr;
 end
 
 -- jf (2026-10-30): job filter -- nil = all jobs, else a job abbreviation
@@ -926,6 +1088,7 @@ local function computeIsolation(isoKey, wf, mf, jf)
     local filteredTimes = {};
 
     for _, e in ipairs(events) do
+        sliceCheck(); -- PERF 2026-10-30: lets a sliced rebuild pause here
         local key, _, evJob = rowKeyFor(e, 'actorName');
         if key == isoKey and evJob ~= nil then lastJob = evJob; end
         local outcome = e.outcome or '';
@@ -1329,7 +1492,7 @@ local function fmtDuration(sec)
 end
 
 local function buildReportLines()
-    local rows, combatSeconds = computeRows('actorName');
+    local rows, combatSeconds = computeRows('actorName', math.huge); -- complete, not sliced
     local players = {};
     for _, r in ipairs(rows) do
         if not r.isMob then table.insert(players, r); end
@@ -1838,14 +2001,64 @@ local function drawFilters(iso, isoIsMob)
     end
 end
 
+-- ---------------------------------------------------------------------------
+-- Isolation result, built as a sliced coroutine (PERF 2026-10-30 -- see the
+-- PERF block near the top). Returns the newest finished result for the
+-- current player + filters, or nil while the very first one is building.
+-- Same refresh rule as before: rebuilt when the data or the view changes,
+-- new events folded in at most every REFRESH_SECONDS.
+-- ---------------------------------------------------------------------------
+local isoDone = nil;   -- { player, fkey, events, n, at, iso }
+local isoJob = nil;    -- { player, fkey, events, n, co }
+
+local function isoResult()
+    local player = state.isolated;
+    local fkey = filterKey(state.wf, state.mf, state.jf);
+    local events = currentEvents();
+    local n = #events;
+    local now = os.clock();
+    local d = isoDone;
+    local sameView = d ~= nil and d.player == player and d.fkey == fkey and d.events == events;
+    if sameView and (d.n == n or (now - d.at) < REFRESH_SECONDS) then
+        return d.iso;
+    end
+    if isoJob == nil or isoJob.player ~= player or isoJob.fkey ~= fkey or isoJob.events ~= events then
+        local wf, mf, jf = state.wf, state.mf, state.jf;
+        isoJob = {
+            player = player, fkey = fkey, events = events, n = n,
+            co = coroutine.create(function() return computeIsolation(player, wf, mf, jf); end),
+        };
+    end
+    sliceDeadline = now + SLICE_BUDGET;
+    sliceCounter = 0;
+    local ok, res = coroutine.resume(isoJob.co);
+    sliceDeadline = nil;
+    if not ok then
+        isoJob = nil;
+        error(res, 0);
+    end
+    if coroutine.status(isoJob.co) == 'dead' then
+        isoDone = { player = player, fkey = fkey, events = events, n = isoJob.n, at = now, iso = res };
+        isoJob = nil;
+        return res;
+    end
+    -- still building: keep showing the previous result for this same view
+    -- (same data table only -- after a wipe the old numbers are not shown)
+    if sameView then return d.iso; end
+    return nil;
+end
+
 local function drawIsolation()
     local isoIsMob = state.isolated:sub(-6) == ' (mob)';
-    local iso = cached('iso', state.isolated .. '#' .. filterKey(state.wf, state.mf, state.jf), function()
-        return computeIsolation(state.isolated, state.wf, state.mf, state.jf);
-    end);
+    local iso = isoResult();
 
     if imgui.Button('< Full list###mobparser_iso_back') then
         state.isolated = nil;
+        return;
+    end
+    if iso == nil then
+        imgui.SameLine();
+        imgui.TextDisabled('(building...)');
         return;
     end
     imgui.SameLine();
@@ -2099,25 +2312,119 @@ local function drawDataButtons()
     end
 end
 
+-- Party saves dropdown (2026-10-31). Lists every save, newest first;
+-- picking one loads it (a slice per frame) and shows it like Session.
+local SAVES_COMBO_WIDTH = 300;
+local savesListCache = { version = -1, list = {}, labels = {} };
+
+local function savesList()
+    local v = party_saves.version();
+    if savesListCache.version ~= v then
+        local list = party_saves.list();
+        local labels = {};
+        for i, m in ipairs(list) do labels[i] = party_saves.label(m); end
+        savesListCache = { version = v, list = list, labels = labels };
+    end
+    return savesListCache.list, savesListCache.labels;
+end
+
+local function leaveSave(newSource)
+    state.source = newSource;
+    state.saveFile = nil;
+    state.mf = nil; -- spawn numbering differs between data sets
+    if party_saves ~= nil then pcall(party_saves.unloadView); end
+end
+
+local function drawSavesCombo()
+    if party_saves == nil then return; end
+    local list, labels = savesList();
+    local preview;
+    if state.source == 'save' and state.saveFile ~= nil then
+        local m = party_saves.metaFor(state.saveFile);
+        preview = m and party_saves.label(m) or state.saveFile;
+    else
+        preview = string.format('Party saves (%d)', #list);
+    end
+    imgui.PushItemWidth(SAVES_COMBO_WIDTH);
+    if imgui.BeginCombo('##mobparser_saves', preview) then
+        if #list == 0 then
+            imgui.TextDisabled('None yet -- one is made each time the session is cleared.');
+        end
+        for i, m in ipairs(list) do
+            local sel = state.source == 'save' and state.saveFile == m.file;
+            if imgui.Selectable(labels[i] .. '##mobparser_save_' .. i, sel) and not sel then
+                local ok, lOk, msg = pcall(party_saves.beginLoad, m.file);
+                if ok and lOk then
+                    state.source = 'save';
+                    state.saveFile = m.file;
+                    state.mf = nil;
+                else
+                    print('[mobparser] party save unavailable: ' .. tostring(ok and msg or lOk));
+                end
+            end
+        end
+        imgui.EndCombo();
+    end
+    imgui.PopItemWidth();
+end
+
 -- All time / Session (2026-10-30). Session mode: All time, Save export,
 -- Clear data. All-time mode: Session + an 'ALL TIME (N events)' label;
 -- Save export and Clear are hidden since they act on the session only.
+-- (2026-10-31) Party saves dropdown after them in every mode; viewing a
+-- save works like All time (Session button + gold label).
 local function drawSourceButtons()
+    if state.source == 'save' then
+        if imgui.Button('Session###mobparser_source') then
+            leaveSave('session');
+            return;
+        end
+        imgui.SameLine();
+        drawSavesCombo();
+        imgui.SameLine();
+        if useSave() then
+            local evs = party_saves.events();
+            local label = string.format('PARTY SAVE (%d events)', evs and #evs or 0);
+            local ok = pcall(imgui.TextColored, { 1.0, 0.75, 0.25, 1.0 }, label);
+            if not ok then imgui.Text(label); end
+        elseif party_saves.isLoading() and party_saves.loadingFile() == state.saveFile then
+            imgui.TextDisabled(string.format('Loading save... %d%%',
+                math.floor((party_saves.loadProgress() or 0) * 100)));
+        else
+            imgui.TextDisabled('(save not loaded)');
+        end
+        return;
+    end
     if state.source == 'alltime' and useAllTime() then
         if imgui.Button('Session###mobparser_source') then
             state.source = 'session';
             state.mf = nil; -- spawn numbering differs between the two
         end
         imgui.SameLine();
+        drawSavesCombo();
+        if party_saves ~= nil then imgui.SameLine(); end
         local label = string.format('ALL TIME (%d events)', #alltime_db.events());
         local ok = pcall(imgui.TextColored, { 1.0, 0.75, 0.25, 1.0 }, label);
         if not ok then imgui.Text(label); end
         return;
     end
+    -- PERF (2026-10-30): All time now loads a slice per frame (alltime_db
+    -- .beginLoad + tick) instead of freezing the game for the whole file.
+    -- The view switches over by itself when the load finishes.
+    if state.source == 'alltime' and alltime_db ~= nil and alltime_db.isLoading ~= nil
+        and alltime_db.isLoading() then
+        if imgui.Button('Cancel###mobparser_source') then
+            state.source = 'session'; -- load keeps going; shown when clicked again
+        end
+        imgui.SameLine();
+        imgui.TextDisabled(string.format('Loading all time... %d%%',
+            math.floor((alltime_db.loadProgress() or 0) * 100)));
+        return;
+    end
     state.source = 'session';
     if alltime_db ~= nil then
         if imgui.Button('All time###mobparser_source') then
-            local ok, lOk, msg = pcall(alltime_db.loadAll);
+            local ok, lOk, msg = pcall(alltime_db.beginLoad);
             if ok and lOk then
                 state.source = 'alltime';
                 state.mf = nil;
@@ -2127,8 +2434,14 @@ local function drawSourceButtons()
         end
         imgui.SameLine();
     end
+    if party_saves ~= nil then
+        drawSavesCombo();
+        imgui.SameLine();
+    end
     drawDataButtons();
 end
+
+local mainDisplayCache = nil; -- see drawMainBody (PERF 2026-10-30)
 
 local function drawMainBody()
     if imgui.Button('Settings') then
@@ -2160,30 +2473,55 @@ local function drawMainBody()
     drawGroupButton('Event type', 'type');
 
     local columns = visibleColumns();
-    local rows = computeRows(state.groupBy);
-    applySort(rows);
-
-    -- 2026-10-29: in Player mode, mob rows (damage the mobs did to you)
-    -- no longer compete with players for the row limit: players first (top
-    -- N), then mobs (top N), each in the current sort order.
-    local total = #rows;
-    if state.groupBy == 'actorName' then
+    local rows, display = nil, nil;
+    do
+        local list, _, buildId, building = computeRows(state.groupBy);
         local limit = getMaxPlayers();
-        local players, mobs = {}, {};
-        for _, r in ipairs(rows) do
-            if r.isMob then table.insert(mobs, r); else table.insert(players, r); end
+        local showEnemies = settings.data.guiShowEnemies == true;
+        -- PERF (2026-10-30): sort + top-N split cached; redone only when the
+        -- rows were rebuilt or the sort / limit / enemy setting changed (was
+        -- re-sorted every frame, allocating strings in the comparator).
+        local dc = mainDisplayCache;
+        if dc == nil or dc.buildId ~= buildId or dc.groupBy ~= state.groupBy
+            or dc.sortKey ~= state.sortKey or dc.sortAsc ~= state.sortAsc
+            or dc.limit ~= limit or dc.showEnemies ~= showEnemies then
+            local sorted = {};
+            for i = 1, #list do sorted[i] = list[i]; end -- never reorder the cached list
+            applySort(sorted);
+            dc = { buildId = buildId, groupBy = state.groupBy, sortKey = state.sortKey,
+                   sortAsc = state.sortAsc, limit = limit, showEnemies = showEnemies };
+            -- 2026-10-29: in Player mode, mob rows (damage the mobs did to you)
+            -- no longer compete with players for the row limit: players first
+            -- (top N), then mobs (top N), each in the current sort order.
+            if state.groupBy == 'actorName' then
+                local players, mobs = {}, {};
+                for _, r in ipairs(sorted) do
+                    if r.isMob then table.insert(mobs, r); else table.insert(players, r); end
+                end
+                -- Enemy rows hidden unless enabled in Settings (default off).
+                if not showEnemies then mobs = {}; end
+                local kept = {};
+                for i = 1, math.min(#players, limit) do table.insert(kept, players[i]); end
+                for i = 1, math.min(#mobs, limit) do table.insert(kept, mobs[i]); end
+                if #players > limit or #mobs > limit then
+                    dc.note = string.format('(top %d of %d players, %d of %d mobs)',
+                        math.min(#players, limit), #players, math.min(#mobs, limit), #mobs);
+                end
+                dc.rows = kept;
+            else
+                dc.rows = sorted;
+            end
+            mainDisplayCache = dc;
         end
-        -- Enemy rows hidden unless enabled in Settings (default off).
-        if settings.data.guiShowEnemies ~= true then mobs = {}; end
-        local kept = {};
-        for i = 1, math.min(#players, limit) do table.insert(kept, players[i]); end
-        for i = 1, math.min(#mobs, limit) do table.insert(kept, mobs[i]); end
-        if #players > limit or #mobs > limit then
+        if dc.note ~= nil then
             imgui.SameLine();
-            imgui.TextDisabled(string.format('(top %d of %d players, %d of %d mobs)',
-                math.min(#players, limit), #players, math.min(#mobs, limit), #mobs));
+            imgui.TextDisabled(dc.note);
         end
-        rows = kept;
+        if building then
+            imgui.SameLine();
+            imgui.TextDisabled('(building...)');
+        end
+        rows, display = dc.rows, dc;
     end
     local shown = #rows;
     imgui.Separator();
@@ -2292,6 +2630,10 @@ function mobparser_gui.isVisible()
 end
 
 -- Offline tests only.
-mobparser_gui._test = { computeIsolation = computeIsolation, computeRows = computeRows, state = state };
+mobparser_gui._test = {
+    computeIsolation = computeIsolation, computeRows = computeRows, state = state,
+    computeCombatSeconds = computeCombatSeconds, computeCombatSecondsSorted = computeCombatSecondsSorted,
+    isoResult = isoResult,
+};
 
 return mobparser_gui;
