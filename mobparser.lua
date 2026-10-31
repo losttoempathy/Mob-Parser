@@ -114,7 +114,10 @@ local debug_log     = require('debug_log');
 local dlac_listener = require('dlac_listener');
 local export_log    = require('export_log');
 local mobparser_settings = require('mobparser_settings');
-local live_export    = require('live_export');
+-- REMOVED (2026-10-30): live_export. It rewrote live_export.json from the
+-- whole session up to 4x/sec on d3d_present, for mobstats -- which is
+-- retired, so nothing read it. live_export.lua is left on disk but no
+-- longer required; /mobparser export and db\ still save everything.
 -- All-time database (2026-10-30): every recorded event is also appended to
 -- <addon>\db\events.jsonl. pcall'd so a missing/broken module never stops
 -- capture.
@@ -200,9 +203,9 @@ ashita.events.register('load', 'mobparser_load', function()
     -- already documented once in this file for addon.path/debug_log --
     -- print the actual resolved path directly rather than inferring it
     -- indirectly from later save/load behavior.
-    print(chat.header('mobparser') .. chat.message(
-        'DIAGNOSTIC -- mobparser_settings.path() = "' ..
-        tostring(mobparser_settings.path()) .. '"'));
+    -- (2026-10-30) The three load-time DIAGNOSTIC prints (settings path,
+    -- addon.path, addon.name) were removed from chat -- they now print
+    -- only when the player runs `/mobparser debug on` (see printPaths).
 
     -- DIAGNOSTIC (2026-07-28, added preemptively after the SECOND
     -- consecutive silent debug_log.txt failure, before waiting for a
@@ -218,10 +221,6 @@ ashita.events.register('load', 'mobparser_load', function()
     -- deliberately limited to values already in scope/already used,
     -- not reaching for new unverified API calls to diagnose a problem
     -- caused by unverified API assumptions in the first place.
-    print(chat.header('mobparser') .. chat.message(
-        'DIAGNOSTIC -- addon.path = "' .. tostring(addon.path) .. '"'));
-    print(chat.header('mobparser') .. chat.message(
-        'DIAGNOSTIC -- addon.name = "' .. tostring(addon.name) .. '"'));
 
     -- BUGFIX (2026-07-28, caught after TWO clean-combat test runs
     -- produced no log file at all -- not even a created-but-empty
@@ -326,12 +325,10 @@ ashita.events.register('load', 'mobparser_load', function()
         end
     end
 
-    print(chat.header('mobparser') .. chat.message(
-        'loaded -- capture/export mode (scope pivot, see project file). ' ..
-        'Debug output: ' .. debugLogPath .. '. Master export file: ' ..
-        masterExportPath .. '. chatlogsDir: ' ..
-        tostring(unknownlog.settings.chatlogsDir) ..
-        '. Commands: /mobparser export | wipe | save | status | gui | report [say|party|linkshell] | setchatlogs <path>.'));
+    -- (2026-10-30) One short line instead of the long path dump. The
+    -- paths are still available via `/mobparser debug on` and
+    -- `/mobparser status`.
+    print(chat.header('mobparser') .. chat.message('loaded -- /mobparser help'));
 end);
 
 ashita.events.register('packet_in', 'mobparser_packet_in', function(e)
@@ -360,6 +357,14 @@ ashita.events.register('packet_in', 'mobparser_packet_in', function(e)
             'packet handler error (this is real information now, not ' ..
             'an expected skeleton-build error -- note what triggered it): '
             .. tostring(err)));
+    end
+
+    -- Clear on zone (2026-10-30, user setting, on by default): 0x00A is
+    -- the incoming zone-in packet (the same ID the removed probe used for
+    -- its zone-change reset). Wipes only the in-memory session -- the
+    -- all-time database already has every event. Silent, no chat line.
+    if e.id == 0x00A and mobparser_settings.data.clearOnZone ~= false then
+        export_log.wipe();
     end
 
     -- (2026-10-29) The probe's packet branches that used to follow here
@@ -448,17 +453,11 @@ ashita.events.register('command', 'mobparser_command', function(e)
 
     elseif sub == 'status' then
         local eventCount, gearStateCount = export_log.stats();
-        local liveEventCount, liveError = live_export.status();
         print(chat.header('mobparser') .. chat.message(string.format(
-            'running session: %d event(s), %d gear state(s). Master file: %s',
-            eventCount, gearStateCount, tostring(masterExportPath))));
-        print(chat.header('mobparser') .. chat.message(string.format(
-            'live export: %s',
-            liveError ~= nil
-                and ('ERROR -- ' .. tostring(liveError))
-                or (liveEventCount == -1
-                    and 'not yet written (no combat events since load, or first write pending)'
-                    or (liveEventCount .. ' event(s) last written')))));
+            'running session: %d event(s), %d gear state(s). Master file: %s. Clear on zone: %s. Debug log: %s',
+            eventCount, gearStateCount, tostring(masterExportPath),
+            (mobparser_settings.data.clearOnZone ~= false) and 'on' or 'off',
+            debug_log.isEnabled() and 'on' or 'off')));
         if alltime_db ~= nil then
             local st = alltime_db.status();
             print(chat.header('mobparser') .. chat.message(string.format(
@@ -523,6 +522,29 @@ ashita.events.register('command', 'mobparser_command', function(e)
             print(chat.header('mobparser') .. chat.message(msg));
         end
 
+    elseif sub == 'debug' then
+        -- (2026-10-30) Session-only toggle for debug_log.txt. Off on
+        -- every load; never wipes the existing file (it only appends).
+        local arg = args[3];
+        local on;
+        if arg == 'on' then on = true;
+        elseif arg == 'off' then on = false;
+        else on = not debug_log.isEnabled(); end
+        debug_log.setEnabled(on);
+        if on then
+            print(chat.header('mobparser') .. chat.message(
+                'debug log ON (until reload) -- appending to ' ..
+                tostring(debug_log.settings.outputPath)));
+            -- The former load-time diagnostics, shown on demand only.
+            print(chat.header('mobparser') .. chat.message(
+                'settings file: ' .. tostring(mobparser_settings.path()) ..
+                ' | addon.path: ' .. tostring(addon.path) ..
+                ' | master export: ' .. tostring(masterExportPath) ..
+                ' | chatlogsDir: ' .. tostring(unknownlog.settings.chatlogsDir)));
+        else
+            print(chat.header('mobparser') .. chat.message('debug log OFF.'));
+        end
+
     elseif sub == 'gui' then
         -- Toggles the live stat-table window (mobparser_gui.lua,
         -- 2026-07-30). No-op with a clear message if the module failed
@@ -538,8 +560,9 @@ ashita.events.register('command', 'mobparser_command', function(e)
         end
 
     else
+        -- Also covers `/mobparser help`.
         print(chat.header('mobparser') .. chat.message(
-            'usage: /mobparser export | wipe | save | status | gui | report [say|party|linkshell] | setchatlogs <path>'));
+            'usage: /mobparser export | wipe | save | status | gui | report [say|party|linkshell] | debug [on|off] | setchatlogs <path>'));
     end
 end);
 
@@ -552,12 +575,9 @@ end);
 -- expensive path (json_encode + io write) only runs when there's
 -- genuinely new data and enough time has passed.
 -- ===========================================================================
-ashita.events.register('d3d_present', 'mobparser_live_export', function()
-    -- (2026-10-29) No selfStats argument any more: it was the probe's
-    -- acc/accAux snapshot for mobstats, both now retired. tick(nil) is
-    -- live_export's documented optional case -- the "selfStats" key is
-    -- simply left out of live_export.json.
-    live_export.tick();
+ashita.events.register('d3d_present', 'mobparser_present', function()
+    -- (2026-10-30) live_export.tick() removed -- see the require note
+    -- near the top of this file.
 
     if alltime_db ~= nil then
         local okT, errT = pcall(alltime_db.tick);

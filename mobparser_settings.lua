@@ -44,6 +44,10 @@ local function defaults()
         -- Open the GUI window automatically when the addon loads
         -- (2026-10-29, user request: on by default, toggle in Settings).
         guiOpenOnLoad = true,
+        -- Wipe the running session (in-memory events) on every zone-in
+        -- (2026-10-30, user request: on by default, toggle in Settings).
+        -- The all-time database (db\events.jsonl) is not affected.
+        clearOnZone = true,
     };
 end
 

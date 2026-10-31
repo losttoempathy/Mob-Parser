@@ -20,10 +20,11 @@ debug_log.settings = {
     -- this module writes anything.
     outputPath = nil,
 
-    -- Master on/off switch, separate from mobparser's other settings,
-    -- so this can be trivially disabled once real aggregation exists
-    -- without touching unrelated code.
-    enabled = true,
+    -- Master on/off switch. (2026-10-30) OFF by default -- turned on
+    -- per session with `/mobparser debug on`. Deliberately NOT persisted:
+    -- every reload starts off again. The existing debug_log.txt is never
+    -- wiped by this module -- it only appends while enabled.
+    enabled = false,
 };
 
 -- Creates the output directory if it doesn't exist. `io.open(path, 'a')`
@@ -58,6 +59,11 @@ end
 
 function debug_log.setEnabled(enabled)
     debug_log.settings.enabled = enabled and true or false;
+    hasWarnedAboutWriteFailure = false; -- allow a fresh warning after re-enabling
+end
+
+function debug_log.isEnabled()
+    return debug_log.settings.enabled == true;
 end
 
 -- Appends one line per classified result to the output file. Called

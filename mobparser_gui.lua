@@ -196,6 +196,7 @@ local state = {
     source     = 'session',   -- 'session' or 'alltime' (2026-10-30)
     wf         = {},          -- isolation weapon filter (see computeIsolation)
     mf         = nil,         -- isolation monster filter (see computeIsolation)
+    jf         = nil,         -- isolation job filter: nil = all jobs, else 'WAR' etc.
 };
 
 -- ===========================================================================
@@ -287,10 +288,23 @@ end
 
 -- Which row an event belongs to. Shared by the main table and isolation
 -- mode so "isolate this row" always means exactly the events that built
--- the row. Returns key, isMob.
+-- the row. Returns key, isMob, job.
+-- job (2026-10-30): the acting player's main-job abbreviation for this
+-- event (actorJob, or finisherJob on skillchains), nil for mobs, pets and
+-- old events without one. The main table splits a player's row by it.
+local function jobOf(e)
+    local jobId = e.actorJob or e.finisherJob;
+    if jobId == nil then return nil; end
+    return JOB_ABBR[jobId] or tostring(jobId);
+end
+
 local function rowKeyFor(e, groupField)
     local key = e[groupField];
     local isMob = false;
+    local job = nil;
+    if key ~= nil and groupField == 'actorName' then
+        job = jobOf(e);
+    end
     if key == nil and groupField == 'actorName' then
         -- 2026-10-29: was a single '(pet/unknown)' bucket. actorName is
         -- only set for party members, so every mob action (hits/misses on
@@ -299,6 +313,7 @@ local function rowKeyFor(e, groupField)
         -- finisher -> the actor's entity name from client memory (mobs)
         -- -> the raw ID, so nothing is ever anonymous.
         key = e.finisherName;
+        if key ~= nil then job = jobOf(e); end
         if key == nil then
             local ent = e.actorEntityName or e.finisherEntityName;
             local id = e.actorId or e.finisherActorId;
@@ -316,7 +331,7 @@ local function rowKeyFor(e, groupField)
         key = e.type or 'unknown';
     end
     if isMob then key = key .. ' (mob)'; end
-    return key, isMob;
+    return key, isMob, job;
 end
 
 -- Combat time for DPS (see DPS_IDLE_GAP above).
@@ -345,18 +360,17 @@ local function computeRowsUncached(groupField)
 
     local events = currentEvents();
     for _, e in ipairs(events) do
-        local key, isMob = rowKeyFor(e, groupField);
+        local name, isMob, job = rowKeyFor(e, groupField);
+        -- 2026-10-30: one row per player per job (Lift WAR / Lift MNK are
+        -- separate rows). Mobs, pets and job-less events keep one row.
+        local key = name;
+        if job ~= nil then key = name .. '\t' .. job; end
         local r = rows[key];
         if r == nil then
-            r = { name = key, isMob = isMob };
+            r = { name = name, job = job, isMob = isMob };
             rows[key] = r;
             table.insert(order, key);
         end
-
-        -- Job: newest value wins, so a mid-session job change shows the
-        -- current job. Mobs have none.
-        local jobId = e.actorJob or e.finisherJob;
-        if jobId ~= nil then r.job = JOB_ABBR[jobId] or tostring(jobId); end
 
         local outcome = e.outcome or '';
         local dmg = type(e.damage) == 'number' and e.damage or 0;
@@ -811,7 +825,7 @@ local function noteTypeName(opt, typ, name)
 end
 
 -- Cache-key fingerprint for the filters.
-local function filterKey(wf, mf)
+local function filterKey(wf, mf, jf)
     local function p(x)
         if x == nil then return '-'; end
         if type(x) == 'table' then return tostring(x.type) .. '/' .. tostring(x.name); end
@@ -819,10 +833,16 @@ local function filterKey(wf, mf)
     end
     wf = wf or {};
     return table.concat({ p(wf.main), p(wf.sub), p(wf.range), p(wf.ammo),
-        mf and (tostring(mf.name) .. '/' .. tostring(mf.id)) or '-' }, '|');
+        mf and (tostring(mf.name) .. '/' .. tostring(mf.id)) or '-',
+        jf or '-' }, '|');
 end
 
-local function computeIsolation(isoKey, wf, mf)
+-- jf (2026-10-30): job filter -- nil = all jobs, else a job abbreviation
+-- ('WAR'). Own events use the event's own job; damage taken uses the
+-- player's most recent job seen before that event (defense events don't
+-- carry the target's job), so a hit taken before the player's first own
+-- action drops out while a job is picked.
+local function computeIsolation(isoKey, wf, mf, jf)
     local events = currentEvents();
     local iso = {
         name = isoKey, found = false, matched = 0,
@@ -840,7 +860,7 @@ local function computeIsolation(isoKey, wf, mf)
         enemies = newBucket(), byTarget = newBucket(), bySpawn = newBucket(),
         dealt = 0, healed = 0,
         -- filter dropdown options
-        opt = { main = {}, sub = {}, range = {}, ammo = {}, mobs = {} },
+        opt = { main = {}, sub = {}, range = {}, ammo = {}, mobs = {}, jobs = {} },
     };
     local isoIsMob = isoKey:sub(-6) == ' (mob)';
     local baseName = (isoKey:gsub(' %(mob%)$', ''));
@@ -849,9 +869,10 @@ local function computeIsolation(isoKey, wf, mf)
     wf = wf or {};
     iso.gearOn = (not isoIsMob) and gearLookupAvailable() and (localPlayerName() == baseName);
     if not iso.gearOn then wf = {}; end
-    if isoIsMob then mf = nil; end
+    if isoIsMob then mf = nil; jf = nil; end
     local wfOn = weaponFilterActive(wf);
-    iso.filtering = wfOn or (mf ~= nil);
+    iso.filtering = wfOn or (mf ~= nil) or (jf ~= nil);
+    local lastJob = nil; -- this player's most recent job, for damage taken
 
     local gearCache = {};
     local function gearOf(e)
@@ -894,7 +915,8 @@ local function computeIsolation(isoKey, wf, mf)
     local filteredTimes = {};
 
     for _, e in ipairs(events) do
-        local key = rowKeyFor(e, 'actorName');
+        local key, _, evJob = rowKeyFor(e, 'actorName');
+        if key == isoKey and evJob ~= nil then lastJob = evJob; end
         local outcome = e.outcome or '';
         local dmg = type(e.damage) == 'number' and e.damage or 0;
         local t = e.type;
@@ -923,9 +945,12 @@ local function computeIsolation(isoKey, wf, mf)
                 end
             end
             if opp ~= nil then noteMob(opp); end
+            local thisJob = mine and evJob or lastJob;
+            if mine and evJob ~= nil then iso.opt.jobs[evJob] = true; end
 
             local pass = true;
-            if wfOn and not passWeapon(wf, g) then pass = false; end
+            if jf ~= nil and thisJob ~= jf then pass = false; end
+            if pass and wfOn and not passWeapon(wf, g) then pass = false; end
             if pass and mf ~= nil then
                 if opp == nil then
                     pass = false;
@@ -1316,6 +1341,7 @@ local function buildReportLines()
         local r = players[i];
         local dmg = r.damage or 0;
         local name = tostring(r.name):gsub('[^%w%s%(%)%-\']', '');
+        if r.job ~= nil then name = name .. ' (' .. r.job .. ')'; end
         local parts = { string.format('%d. %s: %d', i, name, dmg) };
         if totalDmg > 0 then
             table.insert(parts, string.format('(%.1f%%)', dmg / totalDmg * 100));
@@ -1429,6 +1455,11 @@ local function drawSettingsBody()
     local openOnLoad = { settings.data.guiOpenOnLoad ~= false };
     if imgui.Checkbox('Open this window when mobparser loads', openOnLoad) then
         settings.data.guiOpenOnLoad = openOnLoad[1];
+        pcall(settings.save);
+    end
+    local clearOnZone = { settings.data.clearOnZone ~= false };
+    if imgui.Checkbox('Clear session data on zone', clearOnZone) then
+        settings.data.clearOnZone = clearOnZone[1];
         pcall(settings.save);
     end
     local showEnemies = { settings.data.guiShowEnemies == true };
@@ -1771,24 +1802,35 @@ local function drawFilters(iso, isoIsMob)
         end
     end
     if not isoIsMob then
+        -- Job filter (2026-10-30). Keep the current pick listed even if
+        -- a stacked filter hid all its events.
+        local jobs = {};
+        for j in pairs(iso.opt.jobs) do jobs[j] = true; end
+        if state.jf ~= nil then jobs[state.jf] = true; end
+        imgui.Text('Job');
+        imgui.SameLine();
+        local chJ, vJ = nameCombo('mobparser_jf', state.jf, jobs);
+        if chJ then state.jf = vJ; end
+        imgui.SameLine();
         imgui.Text('Monster');
         imgui.SameLine();
         local ch, v = monsterCombo('mobparser_mf', state.mf, iso.opt.mobs);
         if ch then state.mf = v; end
     end
-    if weaponFilterActive(wf) or state.mf ~= nil then
+    if weaponFilterActive(wf) or state.mf ~= nil or state.jf ~= nil then
         imgui.SameLine();
         if imgui.Button('Reset filters###mobparser_filter_reset') then
             state.wf = {};
             state.mf = nil;
+            state.jf = nil;
         end
     end
 end
 
 local function drawIsolation()
     local isoIsMob = state.isolated:sub(-6) == ' (mob)';
-    local iso = cached('iso', state.isolated .. '#' .. filterKey(state.wf, state.mf), function()
-        return computeIsolation(state.isolated, state.wf, state.mf);
+    local iso = cached('iso', state.isolated .. '#' .. filterKey(state.wf, state.mf, state.jf), function()
+        return computeIsolation(state.isolated, state.wf, state.mf, state.jf);
     end);
 
     if imgui.Button('< Full list###mobparser_iso_back') then
@@ -1796,7 +1838,8 @@ local function drawIsolation()
         return;
     end
     imgui.SameLine();
-    imgui.Text(tostring(iso.name) .. (iso.job and ('  [' .. iso.job .. ']') or ''));
+    local jobTag = state.jf or iso.job;
+    imgui.Text(tostring(iso.name) .. (jobTag and ('  [' .. jobTag .. ']') or ''));
 
     if not iso.found then
         imgui.SameLine();
@@ -2039,6 +2082,7 @@ local function drawDataButtons()
             state.isolated = nil; -- isolated player no longer exists after a wipe
             state.wf = {};
             state.mf = nil;
+            state.jf = nil;
             runAction('wipe');
         end
     end
@@ -2154,15 +2198,23 @@ local function drawMainBody()
                         if state.groupBy == 'actorName' then
                             -- isolate this player ('##' + row index keeps the ID unique)
                             if imgui.Button('Iso##mobparser_iso_' .. idx) then
-                                if state.isolated ~= r.name then
+                                if state.isolated ~= r.name or state.jf ~= r.job then
                                     state.wf = {};
                                     state.mf = nil;
                                 end
                                 state.isolated = r.name;
+                                -- 2026-10-30: open on this row's job
+                                state.jf = (not r.isMob) and r.job or nil;
                             end
                             imgui.SameLine();
                         end
-                        imgui.Text(tostring(r.name));
+                        -- Job column hidden: put the job on the name so
+                        -- a player's per-job rows stay distinguishable.
+                        if r.job ~= nil and settings.data.guiShowJob == false then
+                            imgui.Text(tostring(r.name) .. ' (' .. r.job .. ')');
+                        else
+                            imgui.Text(tostring(r.name));
+                        end
                     elseif key == 'job' then
                         if r.job ~= nil then imgui.Text(r.job); else imgui.TextDisabled('--'); end
                     else
