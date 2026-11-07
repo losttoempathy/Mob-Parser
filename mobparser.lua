@@ -106,6 +106,11 @@ local debug_log     = require('debug_log');
 local dlac_listener = require('dlac_listener');
 local export_log    = require('export_log');
 local mobparser_settings = require('mobparser_settings');
+-- (2026-11-07) Tell perfmon this addon's memory grows on purpose: the running
+-- session keeps every event (wiped on zone, capped at 50k events, ~65 MB worst
+-- case). perfmon shows it as "expected" and only flags it past 80 MB.
+-- pcall'd so mobparser runs fine without perf.lua installed.
+pcall(function () require('perf').expect_growth('session log, cleared on zone, capped at 50k events', 81920); end);
 -- (2026-11-07) GUI window key, default Ctrl+M. pcall so a failure here
 -- never stops capture from loading.
 local kbOk, mobparser_keybind = pcall(require, 'mobparser_keybind');
