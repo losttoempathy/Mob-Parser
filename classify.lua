@@ -58,7 +58,7 @@ classify.MSG = {
     -- main-message id -- that's why the xi.msg.basic audit missed it).
     -- AscensionXI live capture: 23 melee results with message=0,
     -- has_spike_effect=true, spike_effect_message=33, every one matching
-    -- a "[Orc Grappler] 4 counter -> Toosik" line in the chat log at the
+    -- a "[Orc Grappler] 4 counter -> PlayerC" line in the chat log at the
     -- same second. Used by classify.offense (mob countered OUR swing).
     SPIKE_COUNTER = 33,
     SPIKE_DMG   = 44,
@@ -68,8 +68,8 @@ classify.MSG = {
     -- TOO_FAR_AWAY 78 -- ADDED 2026-10-29 (AscensionXI). xi.msg.basic
     -- TOO_FAR_AWAY, "<target> is too far away." Live evidence: debug_log
     -- 11:11:28 actor 153 -> Akakabuto, message=78 reaction=0 param 0, and
-    -- the chat log at the same second: "[Cooter] (Too Far) -> Akakabuto"
-    -- right after "[Cooter] Raging Axe -> Akakabuto" -- a weaponskill
+    -- the chat log at the same second: "[PlayerB] (Too Far) -> Akakabuto"
+    -- right after "[PlayerB] Raging Axe -> Akakabuto" -- a weaponskill
     -- that never went off because the mob was out of range. A use-failure,
     -- not a swing: see classify.OUTCOME.TOO_FAR.
     TOO_FAR_AWAY = 78,
@@ -152,10 +152,10 @@ classify.MSG = {
     -- 185), and every single one lined up 1:1 with the chat log's
     -- "<Property>: <dmg> -> <mob>" line at the same second, with
     -- add_effect_param == the skillchain damage shown:
-    --   297 Reverberation  (2/2 events, e.g. Mtlol Dark Harvest, 35 dmg)
-    --   299 Scission       (15/15, e.g. Temper Fast Blade, 18 dmg)
-    --   300 Detonation     (1/1, Cooter Raging Axe, 55 dmg)
-    --   301 Impaction      (3/3, Toosik/Halestorm Combo, 46/10 dmg)
+    --   297 Reverberation  (2/2 events, e.g. PlayerA Dark Harvest, 35 dmg)
+    --   299 Scission       (15/15, e.g. PlayerJ Fast Blade, 18 dmg)
+    --   300 Detonation     (1/1, PlayerB Raging Axe, 55 dmg)
+    --   301 Impaction      (3/3, PlayerC/PlayerD Combo, 46/10 dmg)
     -- So the element DOES come from the message ID after all -- the
     -- open "skillchain-element redesign" item is resolved by this.
     -- Only the 4 IDs actually observed are enabled. The rest of the
@@ -238,14 +238,14 @@ classify.ADD_EFFECT_MSG = {
     -- against the 2026-10-28 chat log):
     -- HP_DRAIN 161: "Additional effect: <n> HP drained from <mob>." --
     --   934 events (Drain Samba procs on melee, base msg 1 or 67), param
-    --   == the drained amount in the log ("[Toosik] 21 HP AE").
+    --   == the drained amount in the log ("[PlayerC] 21 HP AE").
     --   Same ID as classify.MSG.ENDRAIN, which was defined but never
     --   wired into addEffect -- that's why these all fell to UNKNOWN.
     -- TREASURE_HUNTER 603: "AE: TH <n> -> <mob>" -- 14 events (THF melee
     --   procs, base msg 1 or 67), param == the TH level shown (3).
     --   This is the TH proc signal the project had on hold.
     -- STATUS_2 164 (above) is also now CONFIRMED in practice: 239
-    --   ranged-attack procs (base msg 352/353), log reads "Versiontwo AE
+    --   ranged-attack procs (base msg 352/353), log reads "PlayerE AE
     --   -> Clipper (Defense Down)" and param was 149 == Defense Down's
     --   status ID. So param is a STATUS ID here, not damage -- see
     --   classify.addEffect for the damage=0 / statusId fix.
@@ -466,14 +466,14 @@ classify.JA_MSG = {
 
     -- Added 2026-10-29 (AscensionXI live capture, 2026-10-28 chat log):
     -- HEAL_TARGET_AOE 263: Divine Waltz's secondary targets -- 24
-    --   events, log "[Toosik] 72 HP Divine Waltz -> Toosik / 73 HP ->
+    --   events, log "[PlayerC] 72 HP Divine Waltz -> PlayerC / 73 HP ->
     --   Lift / 75 HP -> Mindlor", param == each target's HP.
     --   (Same numeric ID as MAGIC_MSG.HEAL_NO_PREFIX; it just also shows
     --   up on job abilities.)
-    -- DAZE_LETHARGIC 519: "[Toosik] lv. 1 Quickstep -> Clipper", param
+    -- DAZE_LETHARGIC 519: "[PlayerC] lv. 1 Quickstep -> Clipper", param
     --   == daze level (1). The other step dazes (Box/Stutter/Feather)
     --   are NOT added -- not observed yet.
-    -- NO_MESSAGE 0: 115 events, all from Halestorm's "Resonance"
+    -- NO_MESSAGE 0: 115 events, all from PlayerD's "Resonance"
     --   (AscensionXI custom ability -- not in retail), one result per
     --   party member, message 0, param 817 every time. What 817 means
     --   is unknown, so it's kept as effectParam, not interpreted.
@@ -527,8 +527,8 @@ classify.MAGIC_MSG = {
     -- STATUS_GAINS_NO_PREFIX     = 266,  -- REMOVED 2026-07-29: real ID 266 is JA_GAIN_EFFECT, a JOB ABILITY message, not magic
     -- 266 RE-ADDED 2026-10-29 for MAGIC too: AscensionXI live capture
     -- shows it on category 4 -- 19 events, Kupipi's Protectra, one per
-    -- party member, log "Kupipi Protectra -> {5}: Kupipi, Lift, Cinder,
-    -- Mogh, and Toosik (Protect)", param 40 == Protect's status ID. The
+    -- party member, log "Kupipi Protectra -> {5}: Kupipi, Lift, PlayerF,
+    -- PlayerG, and PlayerC (Protect)", param 40 == Protect's status ID. The
     -- audit was right about xi.msg.basic's name for it; it just isn't
     -- JA-only in practice.
     STATUS_GAINS_AOE = 266,
@@ -654,7 +654,7 @@ classify.WS_MSG = {
     HEAL_MP    = 224,
     -- HEAL_MP_AOE 276 -- added 2026-10-29 (AscensionXI live capture):
     -- Kupipi's Moonlight secondary targets, 17 events, log "2 MP -> Lift
-    -- and Cinder / 0 MP -> Mogh, Temper, and Toosik", param == MP.
+    -- and PlayerF / 0 MP -> PlayerG, PlayerJ, and PlayerC", param == MP.
     HEAL_MP_AOE = 276,
 
     -- Drain

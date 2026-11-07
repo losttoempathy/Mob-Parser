@@ -344,7 +344,7 @@ end
 
 -- FFXI main-job IDs as returned by IParty:GetMemberMainJob (the value
 -- export events carry as actorJob). Live export 2026-10-29 confirms the
--- field is numeric: Lift 6 (THF), Broken 3 (WHM), Mtlol 4 (BLM).
+-- field is numeric: Lift 6 (THF), PlayerH 3 (WHM), PlayerA 4 (BLM).
 local JOB_ABBR = {
     [1] = 'WAR', [2] = 'MNK', [3] = 'WHM', [4] = 'BLM', [5] = 'RDM', [6] = 'THF',
     [7] = 'PLD', [8] = 'DRK', [9] = 'BST', [10] = 'BRD', [11] = 'RNG', [12] = 'SAM',
@@ -2727,7 +2727,7 @@ local function drawMainBody()
     drawGroupButton('Event type', 'type');
 
     local columns = visibleColumns();
-    local rows, display = nil, nil;
+    local rows;
     do
         local list, _, buildId, building = computeRows(state.groupBy);
         local limit = getMaxPlayers();
@@ -2775,7 +2775,7 @@ local function drawMainBody()
             imgui.SameLine();
             imgui.TextDisabled('(building...)');
         end
-        rows, display = dc.rows, dc;
+        rows = dc.rows;
     end
     local shown = #rows;
     imgui.Separator();

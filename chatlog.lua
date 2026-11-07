@@ -82,7 +82,7 @@ function chatlog.stripLeadingTimestamps(line)
 
     -- Try a second consecutive timestamp block (the double-timestamp
     -- quirk seen in every SimpleLog sample so far -- see module header).
-    local h2, m2, s2, rest2 = matchLeadingTimestamp(rest);
+    local h2, _, _, rest2 = matchLeadingTimestamp(rest);
     if h2 ~= nil then
         rest = rest2;
     end
@@ -110,14 +110,14 @@ function chatlog.looksLikeCombatOrSystemLine(textAfterTimestamp)
     -- immediately followed by a DIGIT inside the first bracket -- treat
     -- as private/channel chat and exclude, UNLESS it's immediately
     -- followed by another bracketed actor tag (SimpleLog emits lines
-    -- like `[2] [Shadowgod] missed -> Mob` for multi-target combat
+    -- like `[2] [PlayerI] missed -> Mob` for multi-target combat
     -- messages, which ARE combat lines despite the leading channel-
     -- looking digit -- see packet_ground_truth.md examples). Check for
     -- that combat-shaped case FIRST.
     local channelNum, afterChannel = textAfterTimestamp:match('^%[(%d+)%]%s*(.*)$');
     if channelNum ~= nil then
         if afterChannel:sub(1, 1) == '[' then
-            -- e.g. "[2] [Shadowgod] missed -> Mob" -- combat line with a
+            -- e.g. "[2] [PlayerI] missed -> Mob" -- combat line with a
             -- target-count prefix, not a channel-chat line.
             return true;
         end
@@ -139,8 +139,8 @@ function chatlog.looksLikeCombatOrSystemLine(textAfterTimestamp)
     end
 
     -- Fallback: unbracketed lines with no channel/tell markup are
-    -- treated as narrator/system text (e.g. "Shadowgod defeats the
-    -- Goblin Gambler.", "AOE 244 -> Shadowgod") and included. This is
+    -- treated as narrator/system text (e.g. "PlayerI defeats the
+    -- Goblin Gambler.", "AOE 244 -> PlayerI") and included. This is
     -- the least-confident branch of the heuristic -- if false positives
     -- turn out to be common (party comment lines with no channel tag,
     -- if such a thing exists in practice), revisit here.

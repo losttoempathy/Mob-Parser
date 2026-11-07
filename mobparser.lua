@@ -1,104 +1,29 @@
 --[[
 mobparser.lua -- Ashita v4 addon entry point.
 
-STATUS (2026-07-28, SCOPE PIVOT): mobparser is now a capture/export
-tool, not a stat-estimation tool -- see mobparser_PROJECT.md's "SCOPE
-PIVOT" section for the full user-directed change. This file wires in
-export_log.lua (the real data pipeline: gear-stamped events, JSON
-export, wipe, and save-to-master-and-wipe) alongside the existing
-capture layer (combat_router, dlac_listener) and the still-useful
-debug_log.lua diagnostic.
+Read-only combat capture for FFXI (AscensionXI / CatsEyeXI). Parses
+incoming action packets (0x028) for you, your party and pets, tags each
+event with your worn gear (client memory, dlac as fallback), and keeps:
+  - the running session (export_log.lua), shown in the GUI
+  - the all-time database, db\events.jsonl (alltime_db.lua)
+  - a party save of each cleared session, db\saves\ (party_saves.lua)
+Sends nothing to the server and never blocks or edits a packet.
 
-Capture-layer status (packet parsing, offense/defense classification,
-dlac gear tracking) is real, live-tested, and working against real
-CatsEyeXI/dlac data -- see the project file's live-test-results
-sections for exactly what's confirmed. Export-layer status
-(json_encode/json_decode/export_log) is offline-tested only (179+
-checks across the whole project as of this write) -- the slash commands
-below that trigger export/wipe/save are UNTESTED IN-GAME, same caveat
-as every other `*.ashita.*`-facing piece before its first live test.
-Ashita's `command` event registration pattern used below is written
-against the generally-documented Ashita v4 SDK surface, not verified
-against a live client by this project specifically -- treat the first
-`/mobparser` command actually run in-game as a real test, not an
-assumed-working feature.
-
-Still unverified from before the pivot (unaffected by it):
-  1. packet_action.lua's field layout -- CONFIRMED for melee category 1
-     via live-test cross-check against Metrics (see project file).
-  2. combat_router.ashita.*'s entity-index bound (MAX_ENTITY_INDEX) --
-     still unverified but has worked correctly in every live test so
-     far via a confirmed-safe fallback.
-  3. dlac_listener transport -- CONFIRMED working via live test (see
-     project file's dlac live-test-results sections). Gear-tag TIMING
-     correctness -- CONFIRMED for both single-slot and multi-slot
-     mid-fight swaps via live test.
-Category expansion beyond melee (abilities, resting, healing, magic --
-the actual "capture EVERYTHING" goal) is NOT YET DONE -- see project
-file "Open work under the new scope" item 2. This file currently only
-captures melee (combat_router.V1_SCOPED_CATEGORIES), same as before the
-pivot; the pivot changes WHERE captured data goes (export_log.lua's
-JSON, not just debug_log.lua's diagnostic text) and the eventual GOAL
-(capture everything), not yet what gets captured.
-
-TEMPORARY TESTING DEFAULT REMAINING BELOW: debug log output path
-(debugLogPath, computed from addon.path) -- see debug_log.lua for its
-own retirement status.
+Commands: /mobparser help.
 ]]
 
 addon.name    = 'mobparser';
 addon.author  = 'mobparser project';
 addon.version = '0.3.0-capture-export-pivot';
-addon.desc    = 'Combat/action capture and JSON export tool. See file header for scope-pivot status and what remains unverified.';
+addon.desc    = 'Read-only combat capture, all-time database and party saves, with an in-game GUI.';
 
--- NOTE (2026-07-28, corrected after first real /addon load attempt):
--- the ORIGINAL version of this comment claimed the "module 'classify'
--- not found" error was caused by package.path missing the addon's own
--- folder, and that this extension fixed it. THAT WAS WRONG -- the real
--- error log showed Ashita's default search list already includes
--- `\addons\mobparser\classify.lua` natively; the actual root cause was
--- simply that classify.lua (and every other sibling module) had never
--- been copied into the live addon folder at all -- they only existed
--- as chat outputs, never actually placed on disk alongside
--- mobparser.lua. Confirmed directly by the user checking the folder.
--- Real fix: copy every non-test .lua file (chatlog, classify,
--- combat_router, debug_log, formula, mobparser, packet_action,
--- packets_bitreader, unknownlog) into the actual addon folder.
--- This package.path extension is being LEFT IN regardless -- it's
--- harmless (redundant with Ashita's own default search path, not
--- wrong) and cheap insurance in case a different install/Ashita
--- version ever needs it -- but it was never the fix for THIS error,
--- and claiming it was would have been misleading. Lesson: an error
--- message can look like it confirms a hypothesis (both said
--- "not found") while actually pointing somewhere else entirely --
--- worth rereading the FULL search list next time, not just the first
--- line, before writing a fix.
+-- Redundant with Ashita's own search path; kept as cheap insurance.
 if addon.path ~= nil then
-    -- Same doubled-backslash issue as debug_log's path below (addon.path
-    -- already ends in a trailing separator) -- fixed 2026-07-28 for
-    -- consistency, though this specific line was already noted as
-    -- non-load-bearing (Lua's package.path search tolerates redundant
-    -- separators far better than a raw io.open call does).
     package.path = package.path .. ';' .. addon.path .. '?.lua';
 end
 
 require('common');
 
--- BUGFIX (2026-07-28, caught by SECOND real /addon load attempt --
--- addon now loads and gets past the require-chain issue from the
--- first attempt, confirming that fix/diagnosis; this is a genuinely
--- new, unrelated error): `chat.header(...)`/`chat.message(...)` calls
--- below failed with "attempt to index global 'chat' (a nil value)".
--- `chat` is NOT an ambient global the way `print` is -- it's a real
--- Ashita library module that must be explicitly required, confirmed
--- via real addon source (m4thmatic/hticks: `local chat =
--- require('chat');`, alongside its own `require('common')` and other
--- explicit requires). This project's earlier code had been assuming
--- `chat` was ambient, same category of mistake as assuming
--- sibling-module requires would just resolve -- neither offline test
--- could have caught this, since no test file exercises mobparser.lua's
--- load event handler at all (nothing in the offline harness simulates
--- Ashita's real global environment for `chat`, `ashita.events`, etc).
 local chat = require('chat');
 
 local combat_router = require('combat_router');
@@ -147,13 +72,8 @@ local function saveAndWipe(reason)
     export_log.wipe();
     return meta;
 end
--- REMOVED (2026-10-29): mobparser_probe (the /check + /checkparam
--- packet-sending probe, T1 on CatsEyeXI). Retired at user request on
--- moving to AscensionXI: mobstats is retired (dlac covers its stat
--- display), so nothing consumes the probe's acc/accAux any more, and
--- dropping it keeps mobparser strictly read-only -- it sends the server
--- nothing. Every call site below was removed with it; history for the
--- probe design lives in the project archive.
+-- (The /check packet probe was removed 2026-10-29: mobparser sends the
+-- server nothing.)
 
 -- In-game stat display window (2026-07-30, T2 Information Display per
 -- ServerRules.txt -- read-only, sends nothing to the server). Wrapped
@@ -168,18 +88,7 @@ if not guiOk then
     mobparser_gui = nil;
 end
 
--- Session state for the dlac gear-tracking listener (2026-07-28, first
--- wiring-in). This is NOT started/registered until the `load` handler
--- below actually calls dlac_listener.ashita.register(dlacState) --
--- creating the state table here is cheap and side-effect-free (no
--- Ashita calls), matching this project's pattern of keeping
--- construction separate from registration (see combat_router.lua's own
--- route() vs. handlePacket() split). If dlac_listener.lua is ever
--- absent (addon not installed, require fails) this whole file should
--- still load and mobparser should still work WITHOUT gear tagging --
--- per the project's stated one-way, no-load-dependency relationship
--- with its data sources. NOT YET GUARDED that way -- see load handler
--- comment below for why this is flagged, not silently assumed safe.
+-- dlac gear-listener state. Registered in the load handler below.
 local dlacState = dlac_listener.newState();
 
 -- ---------------------------------------------------------------------------
@@ -222,106 +131,14 @@ local guiSuspended = false;
 ashita.events.register('load', 'mobparser_load', function()
     mobparser_settings.load();
 
-    -- (2026-10-29) probeEnabled / autoRefreshEnabled restore removed
-    -- with the probe. An old settings file may still carry those keys;
-    -- mobparser_settings.load() keeps them as inert scalars and nothing
-    -- reads them.
-
-    -- DIAGNOSTIC (2026-07-29, added before this was ever tested):
-    -- mobparser_settings.load() returning cleanly looks IDENTICAL
-    -- whether AshitaCore:GetInstallPath() worked and just found no
-    -- settings file yet (normal first run), or GetInstallPath() itself
-    -- failed/returned nil and installDir() bailed out early -- both
-    -- print the same thing with no visible difference. Same trap
-    -- already documented once in this file for addon.path/debug_log --
-    -- print the actual resolved path directly rather than inferring it
-    -- indirectly from later save/load behavior.
-    -- (2026-10-30) The three load-time DIAGNOSTIC prints (settings path,
-    -- addon.path, addon.name) were removed from chat -- they now print
-    -- only when the player runs `/mobparser debug on` (see printPaths).
-
-    -- DIAGNOSTIC (2026-07-28, added preemptively after the SECOND
-    -- consecutive silent debug_log.txt failure, before waiting for a
-    -- third): rather than guess again at where files are landing,
-    -- print the raw values this whole path saga has been built on top
-    -- of, so the NEXT attempt produces real data instead of another
-    -- assumption. `addon.path` is the value the current debug_log fix
-    -- depends on entirely -- if IT'S wrong/nil/unexpected, that
-    -- explains everything downstream without needing to guess further.
-    -- `ashita.fs.get_ashita_install_path()`-equivalent isn't called
-    -- here since that specific API surface was never confirmed this
-    -- session (would be a THIRD assumption stacked on the first two) --
-    -- deliberately limited to values already in scope/already used,
-    -- not reaching for new unverified API calls to diagnose a problem
-    -- caused by unverified API assumptions in the first place.
-
-    -- BUGFIX (2026-07-28, caught after TWO clean-combat test runs
-    -- produced no log file at all -- not even a created-but-empty
-    -- folder): the relative path 'config/addons/mobparser/...' never
-    -- resolved anywhere -- confirmed by the user directly checking
-    -- Ashita/config/addons and finding nothing, not even the directory
-    -- our own debug_log.lua mkdir fix should have created. Real addon
-    -- examples researched this session (onimitch/minimapcontrol,
-    -- ThornyFFXI/tCrossBar, GetAwayCoxn's LuAshitacast profiles) DO
-    -- confirm Ashita/config/addons/<name>/ is a real, conventional
-    -- location other addons use -- but every one of them writes there
-    -- through Ashita's own `ashita.settings` API, not raw io.open()
-    -- with a bare relative path. That strongly suggests a relative
-    -- path like the one used here doesn't resolve against the Ashita
-    -- folder at all (most likely the game process's own working
-    -- directory instead, which is a different location entirely) --
-    -- this was an unverified assumption from the start, not something
-    -- actually confirmed against real Ashita behavior, and it was
-    -- wrong. Fixed by building an ABSOLUTE path from `addon.path`
-    -- (already confirmed real, already used elsewhere in this file)
-    -- and writing into the addon's own installed folder instead of
-    -- guessing at config/'s location -- less conventional than the
-    -- real config/addons/ pattern other addons use, but addon.path is
-    -- the one path source in this whole file that's actually confirmed
-    -- to resolve correctly (the require-chain fix earlier this session
-    -- proved it works). Revisit using the real ashita.settings API
-    -- properly, or confirming config/addons/'s real resolution, once
-    -- past this immediate testing need -- this is scaffolding, not the
-    -- final answer.
-    -- BUGFIX (2026-07-28, caught by first real in-game load -- user's
-    -- own diagnostic output showed addon.path ALREADY ends in a
-    -- trailing backslash: "...Ashita\addons\mobparser\", not
-    -- "...mobparser"). The previous version of this line unconditionally
-    -- appended '\\debug_log.txt', producing a doubled separator
-    -- ("...mobparser\\debug_log.txt"). Confirmed harmless on its own --
-    -- Windows path APIs and io.open collapse a redundant mid-path
-    -- backslash fine, this is NOT the same thing as a leading UNC-style
-    -- "\\\\server\\share" prefix -- but it was still wrong and worth
-    -- fixing outright rather than leaving an unexplained cosmetic bug
-    -- in a path used for diagnostics. NOT, on its own, a sufficient
-    -- explanation for a missing debug_log.txt -- see the load message
-    -- itself, which never showed debug_log.lua's own one-time
-    -- write-failure warning either. That warning firing would mean
-    -- record() was CALLED and failed; it never firing points at
-    -- record() never being called in the first place (no 0x028 traffic
-    -- reached handlePacket yet, or something upstream errored silently
-    -- despite the pcall wrapper) -- check for combat having actually
-    -- happened after load, and check chat for ANY
-    -- "packet handler error" message from the packet_in handler below,
-    -- before assuming this path fix alone resolves the missing file.
+    -- debug_log.txt lives in the addon folder (addon.path ends in a
+    -- separator). Only written while `/mobparser debug on`.
     local debugLogPath = (addon.path or '.\\') .. 'debug_log.txt';
     debug_log.setOutputPath(debugLogPath);
 
-    -- dlac gear-tracking listener (2026-07-28, first wiring-in for the
-    -- live-test verification step). Per integration-guide.md §2.6:
-    -- "you do not get an automatic greeting" -- ask once at load, and
-    -- tolerate no reply (the stream may be off, or dlac may not be
-    -- installed/loaded at all -- both are normal, not errors). Per
-    -- §2.1: the player must separately type `/dl stream on` for
-    -- anything to arrive at all -- mobparser cannot turn this on, and
-    -- silence is a configuration state, not a bug. Wrapped in the same
-    -- pcall discipline as combat_router.handlePacket's own packet_in
-    -- registration below -- dlac_listener.ashita.register/askWorn are
-    -- UNTESTED IN-GAME (same caveat as combat_router.ashita.* and
-    -- unknownlog.ashita.* were before their own first live tests), and
-    -- a failure here must not prevent the rest of mobparser (the
-    -- primary combat-parsing pipeline, which does not depend on dlac at
-    -- all) from loading and working.
+    -- dlac gear stream: ask once for the worn set and tolerate silence
+    -- (dlac not loaded, or `/dl stream on` not set). A failure here never
+    -- stops combat capture.
     local dlacOk, dlacErr = pcall(function()
         dlac_listener.ashita.register(dlacState);
         dlac_listener.ashita.askWorn();
@@ -374,25 +191,8 @@ ashita.events.register('load', 'mobparser_load', function()
 end);
 
 ashita.events.register('packet_in', 'mobparser_packet_in', function(e)
-    -- combat_router.ashita.* is now real, not a guaranteed-error stub --
-    -- still wrapped in pcall since packet_action.lua's field-layout
-    -- correctness against real CatsEyeXI bytes is exactly what this
-    -- first test is trying to determine; an error here is real,
-    -- useful information, not an expected/designed outcome anymore.
-    --
-    -- dlacState is now passed through (2026-07-28) so combat_router can
-    -- tag each debug_log line with a gear signature -- see
-    -- combat_router.lua's own buildGearTag comment for what this does
-    -- and does not verify yet. Passing dlacState here does NOT create a
-    -- new dependency on dlac being present/loaded: dlacState is always
-    -- a valid (possibly empty) table from dlac_listener.newState()
-    -- regardless of whether dlac itself is installed, streaming, or
-    -- even running -- combat_router.buildGearTag's own nil-checks
-    -- handle "nothing received yet" the same way whether that's because
-    -- dlac isn't installed or just hasn't sent anything yet this
-    -- session (per the guide, both look identical from mobparser's side
-    -- -- silence either way -- which is exactly why the design doesn't
-    -- try to tell them apart).
+    -- dlacState is always a valid (possibly empty) table, so gear tagging
+    -- works the same whether or not dlac is installed or streaming.
     local ok, err = pcall(combat_router.handlePacket, e.id, e.data, dlacState);
     if not ok then
         -- (2026-10-30) throttled -- see reportError
@@ -412,33 +212,12 @@ ashita.events.register('packet_in', 'mobparser_packet_in', function(e)
         end
     end
 
-    -- (2026-10-29) The probe's packet branches that used to follow here
-    -- -- zone-change reset (0x00A/0x00B), auto-refresh on own status
-    -- change (0x037), and /check + /checkparam reply parsing / blocking /
-    -- 'check' event stamping (0x029) -- were removed with the probe.
-    -- mobparser no longer blocks or alters any incoming packet.
+    -- mobparser never blocks or alters an incoming packet.
 end);
 
 -- ===========================================================================
--- Slash commands -- exposes export_log.lua's three lifecycle operations
--- (2026-07-28, scope pivot). UNTESTED IN-GAME -- Ashita v4's `command`
--- event registration pattern used below is written against the
--- generally-documented SDK surface (ashita.events.register('command',
--- name, function(e) ... e.command, e.injected ... end), matching the
--- shape 'load'/'packet_in'/'unload' already use elsewhere in this
--- file), NOT independently re-derived from Ashita's own SDK header
--- source this session, and NOT yet run against a live client -- same
--- caveat as every other *.ashita.* surface in this project before its
--- first live test. Treat the first real `/mobparser` command as a
--- genuine test of this registration working at all, not an assumption.
---
--- `e.injected` (true if the command came from another addon/script
--- rather than the player's own chat input) is checked and IGNORED here
--- deliberately -- these are player-facing session-management commands
--- (export/wipe/save data), not something another addon should be able
--- to trigger unasked. If this needs revisiting (e.g. a future
--- companion addon wanting to trigger a save programmatically), that's
--- a new decision, not an oversight to silently work around.
+-- Slash commands. Commands injected by other addons/scripts are ignored
+-- (player-only), except `toggle`, which the window key sends.
 -- ===========================================================================
 -- ---------------------------------------------------------------------------
 -- Shared export / wipe actions (2026-10-29). Used by both the slash
@@ -536,12 +315,8 @@ ashita.events.register('command', 'mobparser_command', function(e)
         local _, msg = doExport();
         print(chat.header('mobparser') .. chat.message(msg));
 
-    -- REMOVED (2026-10-30, at Brad's request): `/mobparser save`. It read,
-    -- decoded and rewrote the whole mobparser_export.json on the game thread
-    -- (a freeze that grew with the file), and the all-time database (db\)
-    -- plus `/mobparser export` now cover what it did. `/mobparser save` now
-    -- just shows the usage line. An existing mobparser_export.json is left
-    -- on disk untouched.
+    -- (`/mobparser save` was removed 2026-10-30: the all-time database and
+    -- `/mobparser export` replace it.)
 
     elseif sub == 'report' then
         -- 2026-10-29: print the Player view to chat. /mobparser report
