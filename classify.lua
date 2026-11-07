@@ -739,6 +739,11 @@ classify.REACTION = {
 -- project's general anti-invented-ID stance.
 classify.PET_TP_MSG = {
     DAMAGE = 317,
+    -- 2026-11-07 (AscensionXI capture): buff blood pacts. Garuda 596 hit
+    -- every party member with param 36 (Blink) and Carbuncle 514 with
+    -- param 154 (Shining Ruby), message 266 every time (msg.lua: "gains
+    -- the effect of"). param = status ID; no damage.
+    STATUS_GAIN = 266,
 };
 
 -- Outcome bucket names -- the single, unambiguous result of one swing.
@@ -840,6 +845,7 @@ classify.OUTCOME = {
     PET_TP_MOVE_LIKELY_SUCCESS = 'PET_TP_MOVE_LIKELY_SUCCESS',
     PET_TP_MOVE_LIKELY_FAILURE = 'PET_TP_MOVE_LIKELY_FAILURE',
     PET_TP_MOVE_DAMAGE         = 'PET_TP_MOVE_DAMAGE',
+    PET_TP_MOVE_STATUS_GAIN    = 'PET_TP_MOVE_STATUS_GAIN', -- 2026-11-07: buff blood pact landed (statusId lifted)
 
     -- Magic (category 4) outcomes -- see classify.MAGIC_MSG for the
     -- confirmed message IDs each maps from, and classify.magicOffense/
@@ -1803,6 +1809,9 @@ local function classifyPetTpMove(result)
     end
     if result.message == classify.PET_TP_MSG.DAMAGE then
         return classify.OUTCOME.PET_TP_MOVE_DAMAGE, result.param or 0;
+    end
+    if result.message == classify.PET_TP_MSG.STATUS_GAIN then
+        return classify.OUTCOME.PET_TP_MOVE_STATUS_GAIN, 0, { statusId = result.param };
     end
     -- Not silently discarded -- an unrecognized category-13 message is
     -- genuinely expected sometimes given how little of this category's

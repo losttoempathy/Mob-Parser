@@ -635,6 +635,9 @@ local function readPartySnapshot()
                             job = nil, -- pets don't have a job
                             isPet = true,
                             ownerName = memberName,
+                            -- 2026-11-07: owner's job, so the GUI can roll
+                            -- the pet into the owner's per-job row
+                            ownerJob = party:GetMemberMainJob(i),
                         };
                     end
                 end
@@ -1075,6 +1078,27 @@ function combat_router.handlePacket(packetId, packetData, dlacState)
     -- scope expansion the user explicitly requested this session, not
     -- an accidental reversal of that design note.
     local actorPartyInfo = combat_router.ashita.getPartyMemberInfo(action.actor_id);
+    -- 2026-11-07 (pets under owner): the party snapshot refreshes every
+    -- 0.5 s, so a pet summoned since the last refresh isn't in it yet. When
+    -- the actor is YOUR pet (isPet -- only asked when the cheap tracked
+    -- check already said "you or your pet"), build the same info from the
+    -- player entity so the event still carries its owner.
+    if actorPartyInfo == nil and actorIsTrackedPlayerOrPet
+        and combat_router.ashita.isPet(action.actor_id) then
+        local okOP, info = pcall(function()
+            local party = AshitaCore:GetMemoryManager():GetParty();
+            local pl = GetPlayerEntity();
+            local pet = pl and GetEntity(pl.PetTargetIndex) or nil;
+            return {
+                name = pet and pet.Name or nil,
+                job = nil,
+                isPet = true,
+                ownerName = party:GetMemberName(0),
+                ownerJob = party:GetMemberMainJob(0),
+            };
+        end);
+        if okOP and info ~= nil and info.name ~= nil then actorPartyInfo = info; end
+    end
     local actorIsPartyOrPartyPet = (actorPartyInfo ~= nil);
 
     -- 2026-10-29: plain entity name for the actor (mob / anyone), kept in
@@ -1302,6 +1326,7 @@ function combat_router.handlePacket(packetId, packetData, dlacState)
                 actorJob = actorPartyInfo and actorPartyInfo.job or nil,
                 actorIsPet = actorIsPet,
                 actorOwnerName = actorPartyInfo and actorPartyInfo.ownerName or nil,
+                actorOwnerJob = actorPartyInfo and actorPartyInfo.ownerJob or nil, -- 2026-11-07
                 actorEntityName = actorEntityName,
                 targetId = target.id,
                 targetName = targetName,
@@ -1376,6 +1401,10 @@ function combat_router.handlePacket(packetId, packetData, dlacState)
                         finisherJob = actorPartyInfo and actorPartyInfo.job or nil,
                         finisherTargetId = target.id,
                         finisherEntityName = actorEntityName,
+                        -- 2026-11-07: a pet-closed skillchain rolls up to its owner
+                        finisherIsPet = actorIsPet,
+                        finisherOwnerName = actorPartyInfo and actorPartyInfo.ownerName or nil,
+                        finisherOwnerJob = actorPartyInfo and actorPartyInfo.ownerJob or nil,
                         targetName = targetName,
                         property = result.addEffectRaw and result.addEffectRaw.property or nil,
                     };
@@ -1387,6 +1416,8 @@ function combat_router.handlePacket(packetId, packetData, dlacState)
                         actorName = actorPartyInfo and actorPartyInfo.name or nil,
                         actorJob = actorPartyInfo and actorPartyInfo.job or nil,
                         actorIsPet = actorIsPet,
+                        actorOwnerName = actorPartyInfo and actorPartyInfo.ownerName or nil, -- 2026-11-07
+                        actorOwnerJob = actorPartyInfo and actorPartyInfo.ownerJob or nil,
                         actorEntityName = actorEntityName,
                         targetId = target.id,
                         targetName = targetName,

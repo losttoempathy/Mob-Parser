@@ -106,6 +106,10 @@ local debug_log     = require('debug_log');
 local dlac_listener = require('dlac_listener');
 local export_log    = require('export_log');
 local mobparser_settings = require('mobparser_settings');
+-- (2026-11-07) GUI window key, default Ctrl+M. pcall so a failure here
+-- never stops capture from loading.
+local kbOk, mobparser_keybind = pcall(require, 'mobparser_keybind');
+if not kbOk then mobparser_keybind = nil; end
 -- All-time database (2026-10-30): every recorded event is also appended to
 -- <addon>\db\events.jsonl. pcall'd so a missing/broken module never stops
 -- capture.
@@ -349,6 +353,18 @@ ashita.events.register('load', 'mobparser_load', function()
     -- (2026-10-30) One short line instead of the long path dump. The
     -- paths are still available via `/mobparser debug on` and
     -- `/mobparser status`.
+    -- (2026-11-07) Window key (default Ctrl+M; dlac has Ctrl+K, Nexus
+    -- Ctrl+Z). Only speaks up if the key couldn't be bound.
+    if mobparser_keybind ~= nil then
+        local okB, bindOk, bindMsg = pcall(mobparser_keybind.apply,
+            mobparser_settings.data.keybind or mobparser_keybind.DEFAULT);
+        if not okB then
+            print(chat.header('mobparser') .. chat.message('window key failed: ' .. tostring(bindOk)));
+        elseif not bindOk then
+            print(chat.header('mobparser') .. chat.message(tostring(bindMsg)));
+        end
+    end
+
     print(chat.header('mobparser') .. chat.message('loaded -- /mobparser help'));
 end);
 
@@ -465,7 +481,11 @@ ashita.events.register('command', 'mobparser_command', function(e)
     if args[1] ~= '/mobparser' then
         return;
     end
-    if e.injected then
+    -- (2026-11-07) `/mobparser toggle` is what the window key sends. It
+    -- only shows/hides the window, so it is let through even if Ashita
+    -- marks a keybind-issued command as injected; everything else stays
+    -- player-only (see comment above).
+    if e.injected and args[2] ~= 'toggle' then
         return; -- see comment above -- player-facing commands only
     end
     e.blocked = true; -- consume the command, don't let it fall through to the game client
@@ -568,10 +588,41 @@ ashita.events.register('command', 'mobparser_command', function(e)
                 'GUI window ' .. (mobparser_gui.isVisible() and 'shown.' or 'hidden.')));
         end
 
+    elseif sub == 'toggle' then
+        -- (2026-11-07) Sent by the window key: same as `gui` but silent,
+        -- so pressing the key doesn't print to chat every time.
+        if mobparser_gui ~= nil then
+            if guiSuspended then
+                guiSuspended = false;
+                guiErrorStreak = 0;
+            else
+                mobparser_gui.toggle();
+            end
+        end
+
+    elseif sub == 'bind' then
+        -- (2026-11-07) /mobparser bind <key> -- e.g. ^m (Ctrl+M), !p (Alt+P),
+        -- or none. No argument puts back the default (Ctrl+M).
+        if mobparser_keybind == nil then
+            print(chat.header('mobparser') .. chat.message('window key unavailable (keybind module failed to load).'));
+        else
+            local spec = args[3] or mobparser_keybind.DEFAULT;
+            local ok, msg = mobparser_keybind.apply(spec);
+            print(chat.header('mobparser') .. chat.message(tostring(msg)));
+            if ok then
+                mobparser_settings.data.keybind = spec;
+                mobparser_settings.save();
+            end
+        end
+
     else
         -- Also covers `/mobparser help`.
         print(chat.header('mobparser') .. chat.message(
-            'usage: /mobparser export | wipe | status | gui | report [say|party|linkshell] | debug [on|off]'));
+            'usage: /mobparser export | wipe | status | gui | report [say|party|linkshell] | debug [on|off] | bind <key>'));
+        print(chat.header('mobparser') .. chat.message(
+            'window key: ' .. ((mobparser_keybind ~= nil and mobparser_keybind.current() ~= nil)
+                and mobparser_keybind.describe(mobparser_keybind.current()) or 'none') ..
+            ' -- change with /mobparser bind <key>, e.g. ^m (Ctrl+M), !p (Alt+P), or none'));
     end
 end);
 
@@ -617,6 +668,8 @@ ashita.events.register('d3d_present', 'mobparser_present', function()
 end);
 
 ashita.events.register('unload', 'mobparser_unload', function()
+    -- (2026-11-07) remove the window key, only if mobparser made it.
+    if mobparser_keybind ~= nil then pcall(mobparser_keybind.release); end
     if alltime_db ~= nil then pcall(alltime_db.flush); end
     -- (2026-10-31) the session is discarded on unload too: save it, and
     -- write everything still queued now.

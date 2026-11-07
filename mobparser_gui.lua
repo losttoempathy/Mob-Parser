@@ -135,6 +135,7 @@ local STAT_GROUPS = {
     { id = 'pet', label = 'Pet', stats = {
         { key = 'petMelee',  label = 'Pet melee' },
         { key = 'petTpMove', label = 'Pet TP move' },
+        { key = 'petDamage', label = 'Pet dmg' },
     }},
     { id = 'meta', label = 'Other / unclassified', stats = {
         { key = 'skillchain', label = 'Skillchains' },
@@ -373,7 +374,73 @@ local function jobOf(e)
     return JOB_ABBR[jobId] or tostring(jobId);
 end
 
+-- ---------------------------------------------------------------------------
+-- Pets under their owner (2026-11-07). A pet's actions no longer get a row
+-- of their own: they count toward the OWNER's row (owner name + owner job),
+-- like one of the owner's spells, and isolation shows them in a Pets table
+-- that can be broken out by summon.
+--
+-- petOwnerOf(e) -> ownerName, ownerJobId, petName, or nil if not a pet event.
+--   * new events: actorIsPet + actorOwnerName (+ actorOwnerJob), or
+--     finisherIsPet + finisherOwnerName on skillchains (combat_router).
+--   * older events: party-member pets already carried actorOwnerName (no
+--     owner job -- the owner's last job seen is used). Your OWN pet before
+--     2026-11-07 often had no party info at all; a pet_melee / pet_tp_move
+--     row with no actorName can only be yours (party pets always resolve
+--     through the party snapshot), so it goes to the local player.
+-- ---------------------------------------------------------------------------
+local lastJobByName = {}; -- player name -> last job abbreviation seen
+
+-- Local player name, re-read at most once a second (old-event fallback
+-- below can hit this once per event during a rebuild).
+local lnName, lnAt = nil, nil;
+local function localNameCached()
+    local now = os.clock();
+    if lnAt ~= nil and lnName ~= nil and now >= lnAt and (now - lnAt) < 1 then return lnName; end
+    local ok, n = pcall(function()
+        return AshitaCore:GetMemoryManager():GetParty():GetMemberName(0);
+    end);
+    lnAt = now;
+    if ok and type(n) == 'string' and n ~= '' then lnName = n; else lnName = nil; end
+    return lnName;
+end
+
+local function petOwnerOf(e)
+    if e.type == 'skillchain' then
+        if e.finisherIsPet == true and e.finisherOwnerName ~= nil then
+            return e.finisherOwnerName, e.finisherOwnerJob,
+                e.finisherName or e.finisherEntityName or ('#' .. tostring(e.finisherActorId));
+        end
+        return nil;
+    end
+    if e.side == 'defense' then return nil; end -- something hitting the pet: mob's row
+    if e.actorIsPet == true and e.actorOwnerName ~= nil then
+        return e.actorOwnerName, e.actorOwnerJob,
+            e.actorName or e.actorEntityName or ('#' .. tostring(e.actorId));
+    end
+    if (e.type == 'pet_melee' or e.type == 'pet_tp_move') and e.actorName == nil
+            and e.actorOwnerName == nil then
+        local me = localNameCached();
+        if me ~= nil then
+            return me, nil, e.actorEntityName or ('#' .. tostring(e.actorId));
+        end
+    end
+    return nil;
+end
+
 local function rowKeyFor(e, groupField)
+    if groupField == 'actorName' then
+        local owner, ownerJob, petName = petOwnerOf(e);
+        if owner ~= nil then
+            local job = nil;
+            if ownerJob ~= nil then
+                job = JOB_ABBR[ownerJob] or tostring(ownerJob);
+            else
+                job = lastJobByName[owner];
+            end
+            return owner, false, job, petName;
+        end
+    end
     local key = e[groupField];
     local isMob = false;
     local job = nil;
@@ -406,7 +473,8 @@ local function rowKeyFor(e, groupField)
         key = e.type or 'unknown';
     end
     if isMob then key = key .. ' (mob)'; end
-    return key, isMob, job;
+    if job ~= nil and not isMob then lastJobByName[key] = job; end
+    return key, isMob, job, nil;
 end
 
 -- Combat time for DPS (see DPS_IDLE_GAP above). Original sort-based
@@ -447,7 +515,7 @@ end
 -- incrementally).
 local function accumulateRow(c, e, groupField)
     local rows, order = c.rows, c.order;
-    local name, isMob, job = rowKeyFor(e, groupField);
+    local name, isMob, job, petName = rowKeyFor(e, groupField);
     -- 2026-10-30: one row per player per job (Lift WAR / Lift MNK are
     -- separate rows). Mobs, pets and job-less events keep one row.
     local key = name;
@@ -465,6 +533,23 @@ local function accumulateRow(c, e, groupField)
     local isMiss = COUNTS_AS_MISS[outcome] == true;
     -- heal amounts are not damage
     if HEAL_OUTCOMES[outcome] then dmg = 0; end
+
+    -- 2026-11-07: a pet's action counts for its owner like a spell would --
+    -- events, damage and DPS -- but not toward the owner's own swing
+    -- hits / misses / crits / accuracy, defense, WS, magic or JA counts.
+    if petName ~= nil then
+        local d = dmg;
+        if COUNTS_AS_MISS[outcome] or outcome == 'PET_TP_MOVE_LIKELY_FAILURE' then d = 0; end
+        bump(r, 'events');
+        addDmg(r, 'damage', d);
+        addDmg(r, 'petDamage', d);
+        if e.type == 'pet_melee' then bump(r, 'petMelee'); end
+        if outcome:sub(1, 12) == 'PET_TP_MOVE' then bump(r, 'petTpMove'); end
+        if outcome == 'SKILLCHAIN' then bump(r, 'skillchain'); end
+        if outcome == 'UNKNOWN' or outcome == 'UNKNOWN_ADD_EFFECT' then bump(r, 'unknown'); end
+        if state.trackingOn.dps then combatClockAdd(c.clock, e.timestamp); end
+        return;
+    end
 
     bump(r, 'events');
     if isHit then bump(r, 'hits'); end
@@ -741,14 +826,22 @@ end
 local function newEnemyLine(label)
     local l = newLine(label);
     l.wsUses, l.casts = 0, 0;
-    l.physDmg, l.wsDmg, l.magicDmg, l.otherDmg = 0, 0, 0, 0;
+    l.physDmg, l.wsDmg, l.magicDmg, l.otherDmg, l.petDmg = 0, 0, 0, 0, 0;
     l.wsSeen, l.castSeen = {}, {};
     return l;
 end
 
-local function addEnemy(l, e, t, outcome, dmg)
+local function addEnemy(l, e, t, outcome, dmg, isPetEv)
     local d = dealtBy(t, outcome, dmg);
+    if outcome == 'PET_TP_MOVE_LIKELY_FAILURE' then d = 0; end
     l.count = l.count + 1;
+    if isPetEv then
+        -- 2026-11-07: pet damage has its own column and stays out of the
+        -- owner's hits / misses / crits
+        l.petDmg = l.petDmg + d;
+        noteDamage(l, d);
+        return;
+    end
     if t == 'melee' or t == 'ranged' or t == 'pet_melee' or t == 'weaponskill' then
         if ISO_HIT[outcome] then
             l.hits = l.hits + 1;
@@ -769,6 +862,59 @@ local function addEnemy(l, e, t, outcome, dmg)
         l.otherDmg = l.otherDmg + d;
     end
     noteDamage(l, d);
+end
+
+-- Pet lines (2026-11-07). One shape for the "all pets" line, each summon's
+-- line and each summon's per-action lines: melee swings are tallied apart
+-- from abilities so Acc % / Crits only ever describe swings.
+local function newPetLine(label)
+    local l = newLine(label);
+    l.swings, l.swingHits, l.swingMisses, l.swingCrits = 0, 0, 0, 0;
+    return l;
+end
+
+local function addPetEvent(l, e, t, outcome, dmg)
+    l.count = l.count + 1;
+    if t == 'pet_melee' then
+        l.swings = l.swings + 1;
+        if ISO_HIT[outcome] then
+            l.swingHits = l.swingHits + 1;
+            if not ISO_HEAL[outcome] then noteDamage(l, dmg); end
+        elseif ISO_MISS[outcome] then
+            l.swingMisses = l.swingMisses + 1;
+        elseif dmg > 0 and not ISO_HEAL[outcome] then
+            noteDamage(l, dmg);
+        end
+        if ISO_CRIT[outcome] then l.swingCrits = l.swingCrits + 1; end
+        return;
+    end
+    markUse(l, e);
+    if ISO_HEAL[outcome] then
+        l.heal = l.heal + dmg;
+        return;
+    end
+    if ISO_MISS[outcome] or JA_FAILED[outcome] or outcome == 'PET_TP_MOVE_LIKELY_FAILURE' then
+        l.misses = l.misses + 1;
+        return;
+    end
+    if MAGIC_RESISTED[outcome] then l.resists = l.resists + 1; end
+    local d = dealtBy(t, outcome, dmg);
+    if d > 0 then
+        l.hits = l.hits + 1;
+        noteDamage(l, d);
+    end
+end
+
+local function petActionLabel(e, t, outcome)
+    if t == 'pet_melee' then return 'Melee (auto-attack)'; end
+    if t == 'skillchain' then return 'Skillchain: ' .. tostring(e.property or 'unknown'); end
+    if t == 'add_effect' then
+        local label = AE_LABEL[outcome] or outcome;
+        if e.statusName ~= nil then label = label .. ' - ' .. tostring(e.statusName); end
+        return label;
+    end
+    if t == 'pet_tp_move' then return actionLabel(e); end
+    return actionLabel(e) .. ' [' .. (TYPE_LABEL[t] or tostring(t)) .. ']';
 end
 
 -- A mob's action landing on (or missing) a player. Shared by the player
@@ -1031,6 +1177,9 @@ local function computeIsolation(isoKey, wf, mf, jf)
         wsByName = newBucket(), magic = newBucket(), ja = newBucket(),
         effects = newBucket(), other = newBucket(), taken = newBucket(),
         enemies = newBucket(), byTarget = newBucket(), bySpawn = newBucket(),
+        -- 2026-11-07: this player's pets -- one line for all of them, and
+        -- one per summon (each with its own per-action lines)
+        pets = { all = newPetLine('Pets'), bySummon = newBucket() },
         dealt = 0, healed = 0,
         -- filter dropdown options
         opt = { main = {}, sub = {}, range = {}, ammo = {}, mobs = {}, jobs = {} },
@@ -1086,10 +1235,13 @@ local function computeIsolation(isoKey, wf, mf, jf)
     end
 
     local filteredTimes = {};
+    -- 2026-11-07: owner's command JA line by actionId (e.g. "Claw" 592), so
+    -- the pet move with the same id can show its damage on that JA row.
+    local jaLineById = {};
 
     for _, e in ipairs(events) do
         sliceCheck(); -- PERF 2026-10-30: lets a sliced rebuild pause here
-        local key, _, evJob = rowKeyFor(e, 'actorName');
+        local key, _, evJob, petName = rowKeyFor(e, 'actorName');
         if key == isoKey and evJob ~= nil then lastJob = evJob; end
         local outcome = e.outcome or '';
         local dmg = type(e.damage) == 'number' and e.damage or 0;
@@ -1146,7 +1298,41 @@ local function computeIsolation(isoKey, wf, mf, jf)
                 local jobId = e.actorJob or e.finisherJob;
                 if jobId ~= nil then iso.job = JOB_ABBR[jobId] or tostring(jobId); end
 
-                if t == 'melee' then
+                if petName ~= nil then
+                    -- 2026-11-07: pet action -> Pets table only
+                    addPetEvent(iso.pets.all, e, t, outcome, dmg);
+                    local sl = iso.pets.bySummon.map[petName];
+                    if sl == nil then
+                        sl = newPetLine(petName);
+                        sl.actions = newBucket();
+                        iso.pets.bySummon.map[petName] = sl;
+                        table.insert(iso.pets.bySummon.list, sl);
+                    end
+                    addPetEvent(sl, e, t, outcome, dmg);
+                    local al = sl.actions.map[petActionLabel(e, t, outcome)];
+                    if al == nil then
+                        local lab = petActionLabel(e, t, outcome);
+                        al = newPetLine(lab);
+                        sl.actions.map[lab] = al;
+                        table.insert(sl.actions.list, al);
+                    end
+                    addPetEvent(al, e, t, outcome, dmg);
+                    -- 2026-11-07: pet move damage onto the owner's command
+                    -- JA row (Pet dmg columns only -- already in the
+                    -- totals via the Pets table, so not added to l.damage)
+                    if t == 'pet_tp_move' and e.actionId ~= nil then
+                        local jl = jaLineById[e.actionId];
+                        if jl ~= nil then
+                            local d = dealtBy(t, outcome, dmg);
+                            if outcome == 'PET_TP_MOVE_LIKELY_FAILURE' then d = 0; end
+                            if d > 0 then
+                                jl.petDmg = (jl.petDmg or 0) + d;
+                                jl.petHits = (jl.petHits or 0) + 1;
+                                if jl.petHigh == nil or d > jl.petHigh then jl.petHigh = d; end
+                            end
+                        end
+                    end
+                elseif t == 'melee' then
                     addPhysical(iso.phys.melee, outcome, dmg);
                 elseif t == 'ranged' then
                     addPhysical(iso.phys.ranged, outcome, dmg);
@@ -1178,6 +1364,7 @@ local function computeIsolation(isoKey, wf, mf, jf)
                     if outcome == 'MAGIC_HEAL' then l.heal = l.heal + dmg; end
                 elseif t == 'job_ability' then
                     local l = namedLine(iso.ja, actionLabel(e));
+                    if e.actionId ~= nil then jaLineById[e.actionId] = l; end
                     markUse(l, e);
                     l.count = l.count + 1;
                     if outcome == 'JA_DAMAGE' then
@@ -1234,7 +1421,7 @@ local function computeIsolation(isoKey, wf, mf, jf)
                         iso.enemies.map[label] = l;
                         table.insert(iso.enemies.list, l);
                     end
-                    addEnemy(l, e, t, outcome, dmg);
+                    addEnemy(l, e, t, outcome, dmg, petName ~= nil);
                 end
             elseif pass and taken then
                 addTaken(namedLine(iso.taken, TYPE_LABEL[t] or tostring(t)), e, t, outcome, dmg);
@@ -1243,6 +1430,15 @@ local function computeIsolation(isoKey, wf, mf, jf)
     end
 
     for _, l in pairs(iso.phys) do iso.dealt = iso.dealt + l.damage; end
+    iso.dealt = iso.dealt + iso.pets.all.damage;
+    iso.healed = iso.healed + iso.pets.all.heal;
+    sortBucket(iso.pets.bySummon);
+    for _, sl in ipairs(iso.pets.bySummon.list) do sortBucket(sl.actions); end
+    if #iso.pets.bySummon.list == 1 then
+        iso.pets.all.label = 'Pet: ' .. iso.pets.bySummon.list[1].label;
+    elseif #iso.pets.bySummon.list > 1 then
+        iso.pets.all.label = 'Pets (' .. #iso.pets.bySummon.list .. ' summons)';
+    end
     for _, b in ipairs({ iso.magic, iso.ja, iso.effects, iso.other }) do
         for _, l in ipairs(b.list) do
             iso.dealt = iso.dealt + l.damage;
@@ -2125,6 +2321,7 @@ local function drawIsolation()
             { 'WS dmg',   function(l) return fInt(l.wsDmg); end },
             { 'Magic dmg', function(l) return fInt(l.magicDmg); end },
             { 'Other dmg', function(l) return fInt(l.otherDmg); end },
+            { 'Pet dmg',  function(l) return fInt(l.petDmg); end },
             { 'Damage',   function(l) return fInt(l.damage); end },
             { 'High',     function(l) return fInt(l.high); end },
             { '% of dmg', pctOfTotal },
@@ -2153,6 +2350,47 @@ local function drawIsolation()
     end
     if #iso.bySpawn.list > 1 then
         drawIsoTable('mobparser.iso.byspawn', 'Per spawn', mobCols('Mob'), iso.bySpawn.list);
+    end
+
+    -- 1d. Pets (2026-11-07): all of this player's pets as one line, like a
+    --     spell. "By summon" breaks it out per pet, each followed by its
+    --     own actions (melee, blood pacts / TP moves, ...).
+    if iso.pets.all.count > 0 then
+        local petLines;
+        if state.isoPetSplit then
+            petLines = {};
+            for _, sl in ipairs(iso.pets.bySummon.list) do
+                table.insert(petLines, sl);
+                for _, al in ipairs(sl.actions.list) do
+                    al.indent = true;
+                    table.insert(petLines, al);
+                end
+            end
+        else
+            petLines = { iso.pets.all };
+        end
+        local function petAcc(l)
+            local n = l.swingHits + l.swingMisses;
+            if n <= 0 then return nil; end
+            return fPct(l.swingHits, n) or '0.0%';
+        end
+        drawIsoTable('mobparser.iso.pets', 'Pets', {
+            { state.isoPetSplit and 'Summon / action' or 'Pet',
+                          function(l) return (l.indent and '    ' or '') .. l.label; end },
+            { 'Uses',     function(l) return fInt(l.uses); end },
+            { 'Swings',   function(l) return fInt(l.swings); end },
+            { 'Acc %',    petAcc },
+            { 'Crits',    function(l) return fInt(l.swingCrits); end },
+            { 'Failed',   function(l) return fInt(l.misses); end },
+            { 'Damage',   function(l) return fInt(l.damage); end },
+            { 'Avg',      fAvg },
+            { 'High',     function(l) return fInt(l.high); end },
+            { 'Healed',   function(l) return fInt(l.heal); end },
+            { '% of dmg', pctOfTotal },
+        }, petLines);
+        local split = { state.isoPetSplit == true };
+        local okCb, changed = pcall(imgui.Checkbox, 'By summon###mobparser_iso_petsplit', split);
+        if okCb and changed then state.isoPetSplit = split[1]; end
     end
 
     -- 2. Weaponskills by name (melee + ranged)
@@ -2188,7 +2426,7 @@ local function drawIsolation()
 
     -- 4. Job abilities by name
     if #iso.ja.list > 0 then
-        drawIsoTable('mobparser.iso.ja', 'Job abilities', {
+        local jaCols = {
             { 'Ability',  function(l) return l.label; end },
             { 'Uses',     function(l) return fInt(l.uses); end },
             { 'Damage',   function(l) return fInt(l.damage); end },
@@ -2197,7 +2435,23 @@ local function drawIsolation()
             { 'Failed',   function(l) return fInt(l.misses); end },
             { 'Healed',   function(l) return fInt(l.heal); end },
             { '% of dmg', pctOfTotal },
-        }, iso.ja.list);
+        };
+        -- 2026-11-07: damage the pet did with this command (blood pact /
+        -- Ready move with the same id). Counted once, under Pets -- these
+        -- columns only show it here. Hidden when no JA had pet damage.
+        local anyPet = false;
+        for _, l in ipairs(iso.ja.list) do
+            if (l.petDmg or 0) > 0 then anyPet = true; break; end
+        end
+        if anyPet then
+            table.insert(jaCols, #jaCols, { 'Pet dmg',  function(l) return fInt(l.petDmg); end });
+            table.insert(jaCols, #jaCols, { 'Pet avg',  function(l)
+                if (l.petHits or 0) <= 0 then return nil; end
+                return string.format('%.1f', l.petDmg / l.petHits);
+            end });
+            table.insert(jaCols, #jaCols, { 'Pet high', function(l) return fInt(l.petHigh); end });
+        end
+        drawIsoTable('mobparser.iso.ja', 'Job abilities', jaCols, iso.ja.list);
     end
 
     -- 5. Additional effects & skillchains

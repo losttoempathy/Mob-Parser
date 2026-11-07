@@ -41,13 +41,19 @@ three seen in the probe output), so [1] is used with [3] as a fallback.
 ## Deliberately NOT resolved (not probed yet -- returns nil, no guess)
 
   category 1 / 2 (melee, ranged): cmd_arg is not an ability id at all
-  category 5 (item use), category 13 (pet TP moves / blood pacts)
+  category 5 (item use)
+  (category 13 pet TP moves / blood pacts: resolved since 2026-11-07,
+  same id + 512 as job abilities -- see CAT below)
   id 0 on any category (e.g. a mob's interrupted/started cast)
 ]]
 
 local action_names = {};
 
-local CAT = { WS = 3, MAGIC = 4, JA = 6, MOB_TP = 11, UNBLINKABLE_JA = 14 };
+-- PET_TP (2026-11-07): category 13 (pet TP moves / blood pacts) uses the
+-- SAME id as the owner's command JA -- capture: Mazing "Claw" JA id 592,
+-- then Garuda category-13 id 592 for 106 dmg one second later (5 times).
+-- So it resolves exactly like a job ability (id + 512).
+local CAT = { WS = 3, MAGIC = 4, JA = 6, MOB_TP = 11, PET_TP = 13, UNBLINKABLE_JA = 14 };
 local JA_OFFSET = 512;
 local MOB_TP_OFFSET = 256;
 
@@ -68,7 +74,7 @@ function action_names.lookupFor(category, id, outcome)
     if type(id) ~= 'number' or id <= 0 then return nil; end
     if category == CAT.MAGIC then
         return 'spell', id;
-    elseif category == CAT.JA or category == CAT.UNBLINKABLE_JA then
+    elseif category == CAT.JA or category == CAT.UNBLINKABLE_JA or category == CAT.PET_TP then
         return 'ability', id + JA_OFFSET;
     elseif category == CAT.WS then
         if action_names.isJaOnWsCategory(outcome) then
